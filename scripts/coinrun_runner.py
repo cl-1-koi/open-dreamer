@@ -44,6 +44,10 @@ print(json.dumps([{"kind": d.device_kind, "platform": d.platform} for d in jax.d
 class ContractError(RuntimeError):
     """A precondition for doing paid work on this pod is not satisfied."""
 
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details = details
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -75,6 +79,7 @@ def child_env(checkout: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["UV_NO_SYNC"] = "1"
     env["UV_FROZEN"] = "1"
+    env["UV_OFFLINE"] = "1"
     env.setdefault("UV_PYTHON_DOWNLOADS", "never")
     checkout_path = str(checkout)
     prior = env.get("PYTHONPATH")
@@ -189,9 +194,15 @@ def run_smoke(args: argparse.Namespace, checkout: Path, env: dict[str, str]) -> 
             "stderr_tail": tail(result.stderr) if result.returncode else "",
         })
         if result.returncode != 0:
-            raise ContractError(f"{collector} generation failed (rc={result.returncode})")
+            raise ContractError(
+                f"{collector} generation failed (rc={result.returncode})",
+                details={"commands": commands},
+            )
         if not shards:
-            raise ContractError(f"{collector} generation wrote no .array_record shards")
+            raise ContractError(
+                f"{collector} generation wrote no .array_record shards",
+                details={"commands": commands},
+            )
     return {"commands": commands, "elapsed_seconds": round(time.monotonic() - started, 3)}
 
 
@@ -254,6 +265,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result["status"] = "passed"
     except ContractError as exc:
         result["error"] = str(exc)
+        if exc.details is not None:
+            result["failure_details"] = exc.details
     except Exception as exc:  # noqa: BLE001 - never lose the diagnosis
         result["error"] = f"{type(exc).__name__}: {exc}"
     path = runner_dir / f"{args.mode}.json"

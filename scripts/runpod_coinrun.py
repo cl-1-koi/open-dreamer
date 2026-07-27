@@ -878,7 +878,7 @@ def build_remote_script(
             echo "uv.lock mismatch: image=$image_lock checkout=$checkout_lock" >&2
             exit 3
           fi
-          export UV_NO_SYNC=1 UV_FROZEN=1
+          export UV_NO_SYNC=1 UV_FROZEN=1 UV_OFFLINE=1
           export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
           export COINRUN_ARTIFACT_DIR COINRUN_CHECKOUT_ROOT="$REPO_DIR"
           timeout --signal=TERM --kill-after=60 "$experiment_timeout" \

@@ -129,6 +129,9 @@ class DockerfileContractTests(unittest.TestCase):
         ):
             self.assertIn(variable, self.text)
 
+    def test_runtime_forces_uv_to_use_the_prebuilt_cache_offline(self):
+        self.assertIn("UV_OFFLINE=1", self.text)
+
     def test_build_fails_when_lock_hash_arg_does_not_match_copied_lock(self):
         self.assertIn('test "$(sha256sum uv.lock | cut -d\' \' -f1)" = "${UV_LOCK_SHA256}"', self.text)
 
@@ -242,6 +245,7 @@ class ImageContractTests(unittest.TestCase):
         env = runner.child_env(Path("/workspace/open-dreamer"))
         self.assertEqual(env["UV_NO_SYNC"], "1")
         self.assertEqual(env["UV_FROZEN"], "1")
+        self.assertEqual(env["UV_OFFLINE"], "1")
         self.assertTrue(env["PYTHONPATH"].startswith("/workspace/open-dreamer"))
 
 
@@ -363,6 +367,43 @@ class FailureArtifactTests(unittest.TestCase):
             payload = json.loads((artifacts / "runner" / "experiment.json").read_text())
             self.assertIn("controller missing", payload["error"])
 
+    def test_dataset_failure_preserves_the_failed_command_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, lock_sha, commit = make_checkout(root)
+            artifacts = root / "artifacts"
+
+            def failed_generation(command, *, cwd, env, timeout):
+                self.assertEqual(env["UV_OFFLINE"], "1")
+                return subprocess.CompletedProcess(
+                    command, 1, "", "offline dependency lookup failed"
+                )
+
+            originals = runner.check_tools, runner.check_gpu, runner.run
+            runner.check_tools = lambda *a, **k: {}
+            runner.check_gpu = lambda *a, **k: {}
+            runner.run = failed_generation
+            try:
+                with environment(
+                    COINRUN_IMAGE_CONTRACT="1",
+                    COINRUN_UV_LOCK_SHA256=lock_sha,
+                ):
+                    code = runner.main([
+                        "smoke",
+                        f"--checkout-root={checkout}",
+                        f"--artifact-dir={artifacts}",
+                        f"--expect-commit={commit}",
+                    ])
+            finally:
+                runner.check_tools, runner.check_gpu, runner.run = originals
+
+            self.assertEqual(code, 1)
+            payload = json.loads((artifacts / "runner" / "smoke.json").read_text())
+            command = payload["failure_details"]["commands"][0]
+            self.assertEqual(command["collector"], "random")
+            self.assertEqual(command["returncode"], 1)
+            self.assertIn("offline dependency lookup failed", command["stderr_tail"])
+
 
 class ImmutableImageSelectionTests(unittest.TestCase):
     def test_digest_reference_is_accepted(self):
@@ -426,7 +467,7 @@ class RemoteBootstrapTests(unittest.TestCase):
     def test_bootstrap_never_syncs_dependencies_on_the_pod(self):
         script = self.build()
         self.assertNotIn("uv sync", script, "bootstrap must not sync on the pod")
-        self.assertIn("export UV_NO_SYNC=1 UV_FROZEN=1", script)
+        self.assertIn("export UV_NO_SYNC=1 UV_FROZEN=1 UV_OFFLINE=1", script)
 
     def test_bootstrap_still_pins_the_exact_pushed_commit(self):
         script = self.build()
