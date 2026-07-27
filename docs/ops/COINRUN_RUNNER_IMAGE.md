@@ -167,6 +167,10 @@ the launcher state under `bundle_transfer`: `launch_to_endpoint_seconds`,
 `transfer_bytes_per_second`, `remote_verify_extract_seconds`,
 `experiment_started_utc`, `setup_seconds`. No credentials are recorded.
 
+Small, manually verified historical transfer probes are tracked in
+`docs/coinrun_bundle_transfer_observations.csv`. The archive itself remains
+untracked; only its manifest and hashes belong in Git.
+
 ### 6. Recovery and reconstruction
 
 The archive is deliberately not committed. To recover it from a clean checkout:
