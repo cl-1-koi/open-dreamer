@@ -880,17 +880,21 @@ def tokenizer_probe_main(argv: Sequence[str]) -> int:
     dataset_dir = Path(args.dataset_dir).resolve()
     checkpoint_dir = Path(args.checkpoint_dir).resolve()
     output_path = Path(args.output).resolve()
+    (
+        selected_records,
+        skipped_short_records,
+        collector_records_seen,
+        collector_records_selected,
+    ) = select_tokenizer_probe_records(
+        iter_array_records(dataset_dir),
+        sequence_length=args.sequence_length,
+        max_records=args.max_records,
+    )
+
     clips = []
     level_seeds = []
-    skipped_short_records = 0
-    for split, raw_record in iter_array_records(dataset_dir):
-        if split != "val":
-            continue
-        record = pickle.loads(raw_record)
+    for record in selected_records:
         sequence_length = int(record["sequence_length"])
-        if sequence_length < args.sequence_length:
-            skipped_short_records += 1
-            continue
         frame_shape = tuple(
             int(value) for value in record.get("frame_shape", (64, 64, 3))
         )
@@ -900,8 +904,6 @@ def tokenizer_probe_main(argv: Sequence[str]) -> int:
         clips.append(frames[: args.sequence_length])
         if "level_seed" in record:
             level_seeds.append(int(record["level_seed"]))
-        if len(clips) >= args.max_records:
-            break
     if not clips:
         raise PreflightError(
             "Held-out tokenizer probe found no val record long enough for "
@@ -957,6 +959,8 @@ def tokenizer_probe_main(argv: Sequence[str]) -> int:
             "checkpoint_dir": str(checkpoint_dir),
             "checkpoint_step": max(checkpoint_steps) if checkpoint_steps else None,
             "dataset_dir": str(dataset_dir),
+            "collector_records_seen": collector_records_seen,
+            "collector_records_selected": collector_records_selected,
         },
         "elapsed_seconds": elapsed,
         "gpu_memory": _jax_memory_snapshot(),
@@ -973,6 +977,63 @@ def tokenizer_probe_main(argv: Sequence[str]) -> int:
         f"{payload['latent_sample_count']} latent samples"
     )
     return 0
+
+
+def select_tokenizer_probe_records(
+    records: Iterable[tuple[str, bytes]],
+    *,
+    sequence_length: int,
+    max_records: int,
+) -> tuple[list[dict[str, Any]], int, dict[str, int], dict[str, int]]:
+    """Select a deterministic, collector-balanced held-out probe sample."""
+    if sequence_length <= 1:
+        raise ValueError("sequence_length must be greater than 1")
+    if max_records <= 0:
+        raise ValueError("max_records must be positive")
+
+    candidates: dict[str, list[dict[str, Any]]] = {}
+    collector_records_seen: Counter[str] = Counter()
+    skipped_short_records = 0
+    for split, raw_record in records:
+        if split != "val":
+            continue
+        record = pickle.loads(raw_record)
+        collector = str(
+            record.get("collector", record.get("collector_policy", "unknown"))
+        )
+        collector_records_seen[collector] += 1
+        if int(record["sequence_length"]) < sequence_length:
+            skipped_short_records += 1
+            continue
+        bucket = candidates.setdefault(collector, [])
+        if len(bucket) < max_records:
+            bucket.append(record)
+
+    selected: list[dict[str, Any]] = []
+    collector_records_selected: Counter[str] = Counter()
+    collector_names = sorted(candidates)
+    index = 0
+    while len(selected) < max_records:
+        added = False
+        for collector in collector_names:
+            bucket = candidates[collector]
+            if index >= len(bucket):
+                continue
+            selected.append(bucket[index])
+            collector_records_selected[collector] += 1
+            added = True
+            if len(selected) >= max_records:
+                break
+        if not added:
+            break
+        index += 1
+
+    return (
+        selected,
+        skipped_short_records,
+        dict(sorted(collector_records_seen.items())),
+        dict(sorted(collector_records_selected.items())),
+    )
 
 
 def read_events(path: Path) -> list[dict[str, Any]]:

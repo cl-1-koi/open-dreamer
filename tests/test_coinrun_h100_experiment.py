@@ -56,6 +56,12 @@ class CoinRunH100ExperimentScriptTests(unittest.TestCase):
             self.assertIn("dynamics.latent_std=", dynamics)
 
             script_text = SCRIPT.read_text()
+            self.assertIn('"--dynamics-ckpt=$DYNAMICS_DIR/checkpoints"', script_text)
+            self.assertIn('"--tokenizer-ckpt=$TOKENIZER_DIR/checkpoints"', script_text)
+            self.assertIn('"--array-record-path=$DATASET_DIR/val"', script_text)
+            self.assertIn("--p-include-reward=0.25", script_text)
+            self.assertNotIn("--checkpoint-dir=$DYNAMICS_DIR", script_text)
+
             self.assertIn("collector_records_seen", script_text)
             self.assertIn("collector_records_selected", script_text)
             self.assertIn('("random", "scripted")', script_text)

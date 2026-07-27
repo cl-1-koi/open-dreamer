@@ -519,8 +519,11 @@ check_checkpoint_gate dynamics "$DYNAMICS_DIR/checkpoints" || exit $?
 if [[ -f "$REPO_ROOT/scripts/eval_coinrun.py" ]]; then
   eval_dir="$ARTIFACT_DIR/evaluation"
   run_phase evaluator "$DEFAULT_EVAL_SECONDS" uv run python "$REPO_ROOT/scripts/eval_coinrun.py" \
-    "--checkpoint-dir=$DYNAMICS_DIR/checkpoints" "--tokenizer-checkpoint=$TOKENIZER_DIR/checkpoints" \
-    "--dataset-dir=$DATASET_DIR" "--output-dir=$eval_dir" || exit $?
+    "--dynamics-ckpt=$DYNAMICS_DIR/checkpoints" "--tokenizer-ckpt=$TOKENIZER_DIR/checkpoints" \
+    "--array-record-path=$DATASET_DIR/val" "--out-dir=$eval_dir" \
+    --context=8 --horizon=8 --num-windows=32 --batch-size=8 \
+    --denoise-steps=4 --one-step-positions=4 --num-videos=4 \
+    --p-include-reward=0.25 "--seed=$seed" || exit $?
   printf 'passed: scripts/eval_coinrun.py exited successfully\n' > "$ARTIFACT_DIR/gates/evaluator.txt"
 else
   printf 'not required: scripts/eval_coinrun.py is absent; trainer rollout evaluator is gated below\n' > "$ARTIFACT_DIR/gates/evaluator.txt"

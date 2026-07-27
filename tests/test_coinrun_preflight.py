@@ -22,6 +22,7 @@ from scripts.coinrun_preflight import (
     fatal_artifact_failures,
     find_coinrun_config,
     run_bounded_command,
+    select_tokenizer_probe_records,
     summarize_dataset_records,
     summarize_training_events,
     validate_checkpoint_cadence,
@@ -114,6 +115,41 @@ class TrainingTelemetryTests(unittest.TestCase):
 
 
 class DatasetTelemetryTests(unittest.TestCase):
+    def test_tokenizer_probe_balances_collectors_despite_shard_order(self):
+        def record(collector, seed, length=16):
+            return (
+                "val",
+                pickle.dumps(
+                    {
+                        "collector": collector,
+                        "level_seed": seed,
+                        "sequence_length": length,
+                    }
+                ),
+            )
+
+        records = [
+            *(record("random", seed) for seed in range(8)),
+            *(record("scripted", 100 + seed) for seed in range(8)),
+            record("scripted", 999, length=4),
+        ]
+
+        selected, skipped, seen, selected_counts = (
+            select_tokenizer_probe_records(
+                records,
+                sequence_length=16,
+                max_records=6,
+            )
+        )
+
+        self.assertEqual(
+            [item["collector"] for item in selected],
+            ["random", "scripted"] * 3,
+        )
+        self.assertEqual(skipped, 1)
+        self.assertEqual(seen, {"random": 8, "scripted": 9})
+        self.assertEqual(selected_counts, {"random": 3, "scripted": 3})
+
     def test_default_generator_uses_isolated_pep723_scripted_arm(self):
         repo_root = Path(__file__).resolve().parents[1]
         dataset_dir = Path("/tmp/coinrun-preflight-dataset")
