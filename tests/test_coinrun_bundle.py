@@ -647,6 +647,26 @@ class CommandConstructionTests(unittest.TestCase):
         self.assertIn("cat", command_text)
         self.assertIn(hashlib.sha256(payload.encode()).hexdigest(), command_text)
 
+    def test_experiment_installer_executes_under_bash(self):
+        payload = "#!/bin/sh\necho installed\n"
+        expected_sha = hashlib.sha256(payload.encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "run_coinrun.sh"
+            result = subprocess.run(
+                [
+                    "bash", "-c", rc.REMOTE_SCRIPT_INSTALL,
+                    "coinrun-script-install", str(target),
+                    expected_sha, str(len(payload.encode())),
+                ],
+                input=payload,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), payload)
+            self.assertTrue(target.stat().st_mode & 0o100)
+
     def test_bundle_shim_exports_nvidia_wheel_library_paths(self):
         script = rc.REMOTE_BUNDLE_SETUP
         self.assertIn('python_lib="$target/venv/lib/python3.11/site-packages"', script)

@@ -1545,7 +1545,7 @@ def install_remote_script(
         key=key,
         known_hosts=known_hosts,
         remote=[
-            "sh", "-c", REMOTE_SCRIPT_INSTALL,
+            "bash", "-c", REMOTE_SCRIPT_INSTALL,
             "coinrun-script-install", "/tmp/run_coinrun.sh",
             hashlib.sha256(script_bytes).hexdigest(), str(len(script_bytes)),
         ],
