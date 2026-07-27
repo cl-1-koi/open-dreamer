@@ -241,7 +241,7 @@ class CredentialAndHTTPTests(unittest.TestCase):
         self.assertIn("open-dreamer-coinrun", seen["user_agent"])
         self.assertNotIn("top-secret", seen["url"])
 
-    def test_log_stream_uses_bearer_token_and_offset(self):
+    def test_log_stream_uses_proxy_safe_query_token_and_offset(self):
         seen = {}
 
         def opener(request, timeout):
@@ -254,8 +254,13 @@ class CredentialAndHTTPTests(unittest.TestCase):
         )
 
         self.assertEqual(result, (b"line\n", 5))
-        self.assertEqual(seen["authorization"], "Bearer stream-secret")
-        self.assertTrue(seen["url"].endswith("/log?offset=0"))
+        self.assertIsNone(seen["authorization"])
+        parsed = urllib.parse.urlparse(seen["url"])
+        self.assertEqual(parsed.path, "/log")
+        self.assertEqual(
+            urllib.parse.parse_qs(parsed.query),
+            {"offset": ["0"], "token": ["stream-secret"]},
+        )
 
 
 class GitAndPreflightGateTests(unittest.TestCase):

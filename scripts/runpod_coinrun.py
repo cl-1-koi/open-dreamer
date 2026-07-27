@@ -597,12 +597,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
-        authorization = self.headers.get("Authorization", "")
-        expected = "Bearer " + os.environ["COINRUN_STREAM_TOKEN"]
-        if not hmac.compare_digest(authorization, expected):
+        parsed = urllib.parse.urlparse(self.path)
+        supplied = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+        expected = os.environ["COINRUN_STREAM_TOKEN"]
+        if not hmac.compare_digest(supplied, expected):
             self.send_error(403)
             return
-        parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/log":
             try:
                 offset = max(0, int(urllib.parse.parse_qs(parsed.query).get("offset", ["0"])[0]))
@@ -874,12 +874,11 @@ def fetch_log_chunk(
     opener: Callable[..., Any] = urllib.request.urlopen,
     timeout: float = 15.0,
 ) -> tuple[bytes, int] | None:
-    url = f"https://{pod_id}-8000.proxy.runpod.net/log?offset={offset}"
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {stream_token}"},
-        method="GET",
+    query = urllib.parse.urlencode(
+        {"offset": offset, "token": stream_token}
     )
+    url = f"https://{pod_id}-8000.proxy.runpod.net/log?{query}"
+    request = urllib.request.Request(url, method="GET")
     try:
         with opener(request, timeout=timeout) as response:
             data = response.read()
@@ -904,13 +903,10 @@ def fetch_manifest(
 ) -> dict[str, Any] | None:
     url = (
         f"https://{pod_id}-8000.proxy.runpod.net/"
-        "artifact-manifest.json"
+        "artifact-manifest.json?"
+        + urllib.parse.urlencode({"token": stream_token})
     )
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {stream_token}"},
-        method="GET",
-    )
+    request = urllib.request.Request(url, method="GET")
     try:
         with opener(request, timeout=timeout) as response:
             data = response.read(8 * 1024 * 1024)
@@ -955,12 +951,11 @@ def download_artifact_archive(
     if not SHA_RE.fullmatch(expected_sha):
         raise DeploymentError("Remote artifact archive has an invalid SHA-256")
 
-    url = f"https://{pod_id}-8000.proxy.runpod.net/artifacts.tar.gz"
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {stream_token}"},
-        method="GET",
+    url = (
+        f"https://{pod_id}-8000.proxy.runpod.net/artifacts.tar.gz?"
+        + urllib.parse.urlencode({"token": stream_token})
     )
+    request = urllib.request.Request(url, method="GET")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     digest = hashlib.sha256()

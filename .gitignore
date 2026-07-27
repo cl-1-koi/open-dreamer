@@ -8,6 +8,7 @@ wandb/
 run_job.sh
 logs
 /data/
+/artifacts/runpod_coinrun/
 
 # Next.js / frontend
 frontend/**/.next/
