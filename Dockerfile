@@ -142,7 +142,10 @@ COPY --from=uv-src /uv /uvx /usr/local/bin/
 COPY --from=builder /opt/coinrun /opt/coinrun
 
 COPY scripts/coinrun_runner.py /opt/coinrun/runner/coinrun_runner.py
-RUN printf '#!/bin/sh\nexec /opt/coinrun/venv/bin/python /opt/coinrun/runner/coinrun_runner.py "$@"\n' \
+RUN nvidia_libs="$(find /opt/coinrun/venv/lib/python3.11/site-packages/nvidia \
+        -type d -name lib -print 2>/dev/null | sort | paste -sd: -)" \
+    && printf '#!/bin/sh\nexport LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\nexec /opt/coinrun/venv/bin/python /opt/coinrun/runner/coinrun_runner.py "$@"\n' \
+      "$nvidia_libs" \
       > /usr/local/bin/coinrun-runner \
     && chmod 0755 /usr/local/bin/coinrun-runner
 

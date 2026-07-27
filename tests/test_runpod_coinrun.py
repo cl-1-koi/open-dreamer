@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -287,6 +288,32 @@ class CredentialAndHTTPTests(unittest.TestCase):
                 "pod-1", "stream-secret", opener=opener
             )
         )
+
+    def test_artifact_download_accepts_a_real_sha256(self):
+        payload = b"artifact bytes"
+        manifest = {
+            "archive": {
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        }
+
+        def opener(request, timeout):
+            return FakeResponse(payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "artifacts.tar.gz"
+            runpod_coinrun.download_artifact_archive(
+                "pod-1",
+                manifest,
+                "stream-secret",
+                destination,
+                deadline=10.0,
+                max_bytes=1024,
+                opener=opener,
+                clock=lambda: 0.0,
+            )
+            self.assertEqual(destination.read_bytes(), payload)
 
 
 class GitAndPreflightGateTests(unittest.TestCase):

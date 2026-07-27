@@ -624,6 +624,36 @@ class CommandConstructionTests(unittest.TestCase):
         self.assertIn("exit 12", str(caught.exception))
         self.assertIn("sha mismatch", str(caught.exception))
 
+    def test_experiment_script_is_stdin_data_not_shell_source(self):
+        captured = {}
+
+        def runner(command, **kwargs):
+            captured["command"] = command
+            captured["input"] = kwargs["input"]
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        payload = "#!/bin/sh\necho experiment-payload\n"
+        rc.install_remote_script(
+            "1.2.3.4",
+            22,
+            key=Path("/k"),
+            known_hosts=Path("/kh"),
+            remote_script=payload,
+            runner=runner,
+        )
+        command_text = " ".join(captured["command"])
+        self.assertEqual(captured["input"], payload)
+        self.assertNotIn("experiment-payload", command_text)
+        self.assertIn("cat", command_text)
+        self.assertIn(hashlib.sha256(payload.encode()).hexdigest(), command_text)
+
+    def test_bundle_shim_exports_nvidia_wheel_library_paths(self):
+        script = rc.REMOTE_BUNDLE_SETUP
+        self.assertIn('python_lib="$target/venv/lib/python3.11/site-packages"', script)
+        self.assertIn('"$python_lib/nvidia"', script)
+        self.assertIn("LD_LIBRARY_PATH", script)
+        self.assertIn("paste -sd:", script)
+
 
 class ContractEnvExportTests(unittest.TestCase):
     def test_bundle_mode_exports_the_manifest_contract_env(self):
@@ -739,9 +769,10 @@ class RemoteHardeningTests(unittest.TestCase):
             )
             expected_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
             expected_bytes = str(manifest_path.stat().st_size)
-        self.assertIn(expected_sha, captured["command"])
-        self.assertIn(expected_bytes, captured["command"])
-        self.assertIn(manifest_path.name, captured["command"])
+        command_text = " ".join(captured["command"])
+        self.assertIn(expected_sha, command_text)
+        self.assertIn(expected_bytes, command_text)
+        self.assertIn(manifest_path.name, command_text)
 
     def test_remote_script_is_installed_and_verified_before_launch(self):
         self.assertIn("script sha mismatch", rc.REMOTE_SCRIPT_INSTALL)

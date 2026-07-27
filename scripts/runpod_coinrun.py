@@ -62,6 +62,7 @@ GPU_IDS = {
 }
 TERMINAL_TERMINATION_STATES = {"pod_absent", "terminated"}
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class DeploymentError(RuntimeError):
@@ -1226,7 +1227,9 @@ def ssh_command(
         f"{SSH_USER}@{host}",
     ]
     if remote:
-        command.extend(remote)
+        # OpenSSH concatenates argv after the host and reparses it through a
+        # remote shell. Preserve argument boundaries explicitly.
+        command.append(" ".join(shlex.quote(part) for part in remote))
     return command
 
 
@@ -1475,6 +1478,15 @@ test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "P
 # experiment command runs.
 printf '#!/bin/sh\nexec %s/venv/bin/python "${COINRUN_CHECKOUT_ROOT:-/workspace/open-dreamer}/scripts/coinrun_runner.py" "$@"\n' \
   "$target" > /usr/local/bin/coinrun-runner
+# JAX's pip CUDA plugin does not add the NVIDIA wheel directories to the
+# dynamic loader path in this environment. Without these directories cuSPARSE
+# is present on disk but invisible, and JAX silently falls back to CPU.
+python_lib="$target/venv/lib/python3.11/site-packages"
+nvidia_libs="$(find "$python_lib/nvidia" -type d -name lib -print 2>/dev/null | sort | paste -sd: -)"
+if [ -n "$nvidia_libs" ]; then
+  sed -i "2i export LD_LIBRARY_PATH=$nvidia_libs\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" \
+    /usr/local/bin/coinrun-runner
+fi
 chmod 0755 /usr/local/bin/coinrun-runner
 command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 17; }
 
@@ -1511,6 +1523,46 @@ def install_remote_bundle(
         raise DeploymentError(
             f"remote bundle verification failed (exit {result.returncode}): "
             f"{(result.stderr or result.stdout).strip()[:600]}"
+        )
+
+
+def install_remote_script(
+    host: str,
+    port: int,
+    *,
+    key: Path,
+    known_hosts: Path,
+    remote_script: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout: float | None = None,
+) -> None:
+    """Install the generated script as `cat` data, never as shell source."""
+
+    script_bytes = remote_script.encode("utf-8")
+    command = ssh_command(
+        host,
+        port,
+        key=key,
+        known_hosts=known_hosts,
+        remote=[
+            "sh", "-c", REMOTE_SCRIPT_INSTALL,
+            "coinrun-script-install", "/tmp/run_coinrun.sh",
+            hashlib.sha256(script_bytes).hexdigest(), str(len(script_bytes)),
+        ],
+    )
+    result = runner(
+        command,
+        input=remote_script,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise DeploymentError(
+            f"could not install the remote experiment script "
+            f"(exit {result.returncode}): "
+            f"{(result.stderr or result.stdout).strip()[:400]}"
         )
 
 
@@ -1634,24 +1686,15 @@ def perform_bundle_setup(
     )
     # Two separate SSH calls. Combining them risks the backgrounded list
     # returning before `cat` has consumed stdin, leaving a truncated script.
-    script_bytes = remote_script.encode("utf-8")
-    install = runner(
-        ssh_command(
-            host, port, key=key, known_hosts=known_hosts,
-            remote=[
-                "bash", "-s", "--", "/tmp/run_coinrun.sh",
-                hashlib.sha256(script_bytes).hexdigest(), str(len(script_bytes)),
-            ],
-        ),
-        input=REMOTE_SCRIPT_INSTALL, text=True, capture_output=True,
-        check=False, timeout=120,
+    install_remote_script(
+        host,
+        port,
+        key=key,
+        known_hosts=known_hosts,
+        remote_script=remote_script,
+        runner=runner,
+        timeout=120,
     )
-    if install.returncode != 0:
-        raise DeploymentError(
-            f"could not install the remote experiment script "
-            f"(exit {install.returncode}): "
-            f"{(install.stderr or install.stdout).strip()[:400]}"
-        )
 
     launch = runner(
         ssh_command(
@@ -1822,7 +1865,7 @@ def download_artifact_archive(
             f"Remote artifact archive size {expected_size} exceeds "
             f"the {max_bytes} byte bound"
         )
-    if not SHA_RE.fullmatch(expected_sha):
+    if not SHA256_RE.fullmatch(expected_sha):
         raise DeploymentError("Remote artifact archive has an invalid SHA-256")
 
     url = (

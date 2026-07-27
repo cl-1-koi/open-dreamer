@@ -6,3 +6,5 @@ started_utc,source,destination,payload_bytes,elapsed_seconds,bytes_transferred,o
 ,local-a10,hetzner-cloud-fw-w1,67108864,11.05,67108864,success,6073209,"Start time was not captured. 64 MiB incompressible slice of the bundle; one-file rsync with --whole-file."
 ,local-a10,hetzner-robot-fw-robot1,67108864,8.36,67108864,success,8027376,"Start time was not captured. 64 MiB incompressible slice of the bundle; one-file rsync with --whole-file. Selected as the staging relay."
 ,local-a10,hetzner-robot-fw-robot1,3000767065,247.17,3000767065,success,12140515,"Start time was not captured. Full archive plus checked-in manifest; remote SHA-256 and byte sizes verified."
+,hetzner-robot-fw-robot1,runpod-h200,3000767065,38.273,3000767065,success,78403363,"Pod 7t2serfh0evvps. Endpoint 216.949s after launch; verify/extract 16.906s; total setup 279.662s."
+,hetzner-robot-fw-robot1,runpod-h200,3000767065,173.729,3000767065,success,17272677,"Pod nyxmuv93zbnlah. Endpoint 83.236s after launch; verify/extract 14.350s; total setup 275.066s. Smoke then exposed missing NVIDIA wheel paths in LD_LIBRARY_PATH."

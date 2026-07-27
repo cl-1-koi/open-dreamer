@@ -202,6 +202,17 @@ Small, manually verified historical transfer probes are tracked in
 `docs/coinrun_bundle_transfer_observations.csv`. The archive itself remains
 untracked; only its manifest and hashes belong in Git.
 
+Observed Hetzner-to-RunPod transfer rates varied from 17.27 MB/s to 78.40 MB/s
+for the same 3.00 GB package. Both successful setups nevertheless reached the
+experiment in about 275-280 seconds because endpoint publication and transfer
+time traded off. Treat provider UI "HTTP service initializing" as the state of
+the port-8000 proxy, not proof that the pod or SSH is unavailable.
+
+The runner shim prepends every `site-packages/nvidia/*/lib` directory to
+`LD_LIBRARY_PATH`. The locked JAX CUDA wheels contain cuSPARSE and the other
+libraries, but JAX 0.10.1 falls back to CPU when the dynamic loader cannot see
+those wheel directories.
+
 ### 7. Recovery and reconstruction
 
 The archive is deliberately not committed. To recover it from a clean checkout:
