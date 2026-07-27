@@ -116,7 +116,7 @@ RUN set -eu; \
     cp /usr/local/bin/uv /opt/coinrun/bin/uv; \
     libenv="$(find /opt/coinrun/uv-cache -name libenv.so -print -quit)"; \
     ldd "$libenv" \
-      | awk '/=> \\/.* \\(0x/ { print $3 }' \
+      | awk '$2 == "=>" && $3 ~ "^/" { print $3 }' \
       | while IFS= read -r library; do \
           case "$(basename "$library")" in \
             libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libresolv.so.*|libutil.so.*) \
