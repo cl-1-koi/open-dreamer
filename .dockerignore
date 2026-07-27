@@ -40,3 +40,22 @@ reactor_code/
 
 # Docs scratch
 reactor-docs*.txt
+
+# --- CoinRun runner image (Dockerfile) ---
+# The runner image copies only pyproject.toml, uv.lock, README.md,
+# dreamer/data/generate_coinrun_dataset.py and scripts/coinrun_runner.py. Every
+# scientific input is read from the runtime Git checkout, so nothing else may
+# enter the build context. Datasets and credentials must never be baked in.
+site/
+datasets/
+artifacts/
+results/
+logs/
+outputs/
+wandb/
+*.array_record
+*.npz
+*.mp4
+*.ckpt
+.runpod/
+

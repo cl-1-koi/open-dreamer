@@ -148,6 +148,9 @@ class FakeAPI:
         return True
 
 
+IMMUTABLE_IMAGE = f"{runpod_coinrun.RUNNER_IMAGE_REPOSITORY}@sha256:{'a' * 64}"
+
+
 def launch_args(root: Path, *, execute=False):
     config = root / "runpod.toml"
     config.write_text('[default]\napi_key = "top-secret"\n', encoding="utf-8")
@@ -160,14 +163,15 @@ def launch_args(root: Path, *, execute=False):
         repo_root=root,
         preflight_report=report,
         gpu="H200",
+        # The prebuilt runner image already carries the locked environment, so
+        # a launch command may no longer run `uv sync` on the pod.
         experiment_command=(
-            "uv sync --frozen && uv run scripts/coinrun_preflight.py "
-            "--output-dir=$COINRUN_ARTIFACT_DIR/run"
+            "coinrun-runner experiment --artifact-dir=$COINRUN_ARTIFACT_DIR"
         ),
         runtime_seconds=runpod_coinrun.MAX_RUNTIME_SECONDS,
         cloud="secure",
         balance_buffer=Decimal("5"),
-        image=runpod_coinrun.DEFAULT_IMAGE,
+        image=IMMUTABLE_IMAGE,
         container_disk_gb=100,
         remote_artifact_dir="/workspace/coinrun-artifacts",
         poll_seconds=0.01,

@@ -38,9 +38,16 @@ GITHUB_REPO_URL = "https://github.com/cl-1-koi/open-dreamer.git"
 POD_NAME_PREFIX = "coinrun-reconstruction-"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 REST_URL = "https://rest.runpod.io/v1"
+# Base image the prebuilt runner is built FROM (see Dockerfile). It is not a
+# valid --image value any more: paid pods must use an immutable reference to the
+# prebuilt runner image so no pod re-installs dependencies.
 DEFAULT_IMAGE = (
     "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"
 )
+RUNNER_IMAGE_REPOSITORY = "ghcr.io/cl-1-koi/open-dreamer-coinrun-runner"
+IMAGE_DIGEST_RE = re.compile(r"^(?P<repository>[^\s@:]+(?::[0-9]+)?(?:/[^\s@:]+)*)@sha256:(?P<digest>[0-9a-f]{64})$")
+IMAGE_COMMIT_TAG_RE = re.compile(r"^(?P<repository>[^\s@:]+(?::[0-9]+)?(?:/[^\s@:]+)*):(?:sha-)?(?P<commit>[0-9a-f]{40})$")
+IMAGE_ROOT = "/opt/coinrun"
 PROXY_USER_AGENT = "cl-1-koi-open-dreamer-coinrun-monitor/1"
 DEFAULT_STATE = (
     Path(__file__).resolve().parents[1]
@@ -537,6 +544,51 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_image_reference(image: str) -> dict[str, str]:
+    """Require an immutable image reference for paid work.
+
+    A mutable tag (``latest``, a moving version tag, or no tag at all) means the
+    pod's dependency environment is whatever the registry happens to serve at
+    launch, which defeats the point of a prebuilt runner. Accept a digest or a
+    commit-pinned tag only.
+    """
+
+    reference = (image or "").strip()
+    if not reference or any(ch.isspace() for ch in reference):
+        raise DeploymentError("--image must be a non-empty reference without whitespace")
+    match = IMAGE_DIGEST_RE.fullmatch(reference)
+    if match:
+        return {
+            "reference": reference,
+            "kind": "digest",
+            "repository": match.group("repository"),
+        }
+    match = IMAGE_COMMIT_TAG_RE.fullmatch(reference)
+    if match:
+        return {
+            "reference": reference,
+            "kind": "commit-tag",
+            "repository": match.group("repository"),
+            "commit": match.group("commit"),
+        }
+    raise DeploymentError(
+        f"--image {reference!r} is not immutable. Use "
+        f"{RUNNER_IMAGE_REPOSITORY}@sha256:<64 hex> or "
+        f"{RUNNER_IMAGE_REPOSITORY}:sha-<40 hex commit>; mutable tags such as "
+        "'latest' are refused for paid runs."
+    )
+
+
+def validate_experiment_command(command: str) -> None:
+    """The prebuilt image already holds the environment; refuse to re-resolve it."""
+
+    if re.search(r"\buv\s+sync\b", command):
+        raise DeploymentError(
+            "--experiment-command must not run 'uv sync'; the runner image already "
+            "contains the locked environment and the pod verifies its uv.lock hash"
+        )
+
+
 def managed_active_pods(pods: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     inactive_statuses = {"EXITED", "STOPPED", "TERMINATED"}
     return [
@@ -799,7 +851,18 @@ def build_remote_script(
           cd "$REPO_DIR"
           git checkout --detach %(commit)s
           test "$(git rev-parse HEAD)" = %(commit)s
-          export COINRUN_ARTIFACT_DIR
+          # The image ships the locked environment. Verify it matches this
+          # commit before spending money; the pod never re-resolves it.
+          test "${COINRUN_IMAGE_CONTRACT:-}" = "1"
+          image_lock="${COINRUN_UV_LOCK_SHA256:-}"
+          checkout_lock="$(sha256sum uv.lock | cut -d' ' -f1)"
+          if [ "$image_lock" != "$checkout_lock" ]; then
+            echo "uv.lock mismatch: image=$image_lock checkout=$checkout_lock" >&2
+            exit 3
+          fi
+          export UV_NO_SYNC=1 UV_FROZEN=1
+          export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
+          export COINRUN_ARTIFACT_DIR COINRUN_CHECKOUT_ROOT="$REPO_DIR"
           timeout --signal=TERM --kill-after=60 "$experiment_timeout" \
             bash -lc %(command)s
         )
@@ -1210,6 +1273,10 @@ def run_launch(
     monitor: Callable[..., dict[str, Any]] = monitor_pod,
 ) -> int:
     validate_runtime(args.runtime_seconds)
+    # Gate here as well as in validate_cli_args: run_launch is the only path
+    # that can spend money, so it must fail closed regardless of entry point.
+    image_reference = validate_image_reference(args.image)
+    validate_experiment_command(args.experiment_command)
     state_path = Path(args.state).expanduser().resolve()
     repo_root = Path(args.repo_root).resolve()
     preflight_path = Path(args.preflight_report).expanduser().resolve()
@@ -1284,6 +1351,8 @@ def run_launch(
         "balance_buffer": float(buffer),
         "commit_sha": git_state.commit_sha,
         "branch": git_state.branch,
+        "image": image_reference["reference"],
+        "image_kind": image_reference["kind"],
         "github_repo": GITHUB_REPO_URL,
         "preflight_report": str(preflight_path),
         "preflight_report_sha256": sha256_file(preflight_path),
@@ -1527,7 +1596,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--cloud", choices=("secure", "community"), default="secure"
     )
     launch.add_argument("--balance-buffer", type=Decimal, default=Decimal("5"))
-    launch.add_argument("--image", default=DEFAULT_IMAGE)
+    launch.add_argument(
+        "--image",
+        required=True,
+        help=(
+            "Immutable prebuilt runner image: "
+            f"{RUNNER_IMAGE_REPOSITORY}@sha256:<digest> or :sha-<commit>"
+        ),
+    )
     launch.add_argument("--container-disk-gb", type=int, default=100)
     launch.add_argument(
         "--remote-artifact-dir",
@@ -1563,6 +1639,8 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_cli_args(args: argparse.Namespace) -> None:
     if args.command != "launch":
         return
+    validate_image_reference(args.image)
+    validate_experiment_command(args.experiment_command)
     if args.container_disk_gb < 50:
         raise DeploymentError("--container-disk-gb must be at least 50")
     if args.poll_seconds <= 0:

@@ -1,0 +1,128 @@
+# NOT YET INSTALLED AT .github/workflows/publish-coinrun-runner.yml
+#
+# The push credential for this branch lacks the GitHub OAuth `workflow` scope,
+# so it cannot create or update files under .github/workflows/. The workflow is
+# kept here verbatim so it is versioned rather than lost. To install it, use a
+# credential that has `workflow` scope and run:
+#
+#     git mv docs/ops/publish-coinrun-runner.yml \
+#            .github/workflows/publish-coinrun-runner.yml
+#     git commit -m "Install CoinRun runner publish workflow" && git push origin HEAD
+#
+# Until then, publish locally per docs/ops/COINRUN_RUNNER_IMAGE.md. See the DISK
+# WARNING below before enabling it at all.
+# Publishes the prebuilt CoinRun runner image to GHCR under the cl-1-koi
+# namespace. Authentication uses the workflow's own GITHUB_TOKEN via
+# `packages: write`; no registry credential is stored in this repository.
+#
+# Tags are immutable on purpose: `sha-<40 hex commit>`. scripts/runpod_coinrun.py
+# refuses any other reference, so a paid pod can only run an image that maps to
+# exactly one commit. No `latest` tag is published.
+#
+# DISK WARNING -- this workflow is NOT proven on a standard GitHub-hosted runner.
+# The finished image is ~26.5 GB and the two-stage build additionally
+# materialises the builder stage and the base image, so peak usage is well above
+# what `ubuntu-latest` provides (~14 GB free on / plus ~65 GB on /mnt). The
+# preflight step below therefore measures free space and FAILS EARLY with a clear
+# message rather than dying part-way through a push. Until a large or
+# self-hosted runner is configured, the supported path is the local build and
+# push documented in docs/ops/COINRUN_RUNNER_IMAGE.md.
+name: Publish CoinRun runner image
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label. ubuntu-latest is expected to fail the disk preflight."
+        required: false
+        default: ubuntu-latest
+      required_free_gb:
+        description: "Minimum free GB required before building."
+        required: false
+        default: "80"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: coinrun-runner-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reclaim what a hosted runner will give back. This is best-effort; the
+      # preflight below is the actual gate.
+      - name: Reclaim disk space (best effort)
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Disk preflight (fail fast, do not exhaust mid-push)
+        run: |
+          set -euo pipefail
+          required_gb="${{ github.event.inputs.required_free_gb || '80' }}"
+          free_gb="$(df --output=avail -BG /var/lib/docker 2>/dev/null || df --output=avail -BG /)"
+          free_gb="$(printf '%s' "$free_gb" | tail -1 | tr -dc '0-9')"
+          echo "free=${free_gb}GB required=${required_gb}GB"
+          if [ "${free_gb}" -lt "${required_gb}" ]; then
+            echo "::error::Only ${free_gb}GB free; the CoinRun runner image needs ~${required_gb}GB." \
+                 "Re-run this workflow with a large or self-hosted runner, or publish locally" \
+                 "per docs/ops/COINRUN_RUNNER_IMAGE.md."
+            exit 1
+          fi
+
+      - name: Resolve build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          lock_sha="$(sha256sum uv.lock | cut -d' ' -f1)"
+          echo "uv_lock_sha256=${lock_sha}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${{ github.repository_owner }}/open-dreamer-coinrun-runner" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable commit tag
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            UV_LOCK_SHA256=${{ steps.meta.outputs.uv_lock_sha256 }}
+            SOURCE_REPO=${{ github.server_url }}/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.coinrun.uv.lock.sha256=${{ steps.meta.outputs.uv_lock_sha256 }}
+
+      - name: Report immutable references
+        run: |
+          set -euo pipefail
+          {
+            echo '## CoinRun runner image published'
+            echo
+            echo '| field | value |'
+            echo '| --- | --- |'
+            echo "| commit tag | \`${{ steps.meta.outputs.image }}:sha-${{ github.sha }}\` |"
+            echo "| digest | \`${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}\` |"
+            echo "| uv.lock sha256 | \`${{ steps.meta.outputs.uv_lock_sha256 }}\` |"
+            echo
+            echo 'Pass the digest to `scripts/runpod_coinrun.py --image`. No `latest` tag exists.'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,14 @@
+# Historical CoinRun runner image builds observed BEFORE scripts/build_coinrun_runner.py existed.
+# Every row here is RECONSTRUCTED from operator observation, `docker image ls` creation
+# timestamps, and docker output -- not wrapper-generated. The `source` column records this and
+# the `provenance` column records how each timestamp was obtained. Empty fields mean "unknown":
+# they are deliberately not filled with estimates.
+#
+# Wrapper-generated records are authoritative and live in
+# artifacts/coinrun_runner/build_history.jsonl (schema coinrun-runner-build-history-v1).
+started_utc,ended_utc,duration_seconds,outcome,image_id,image_size,dockerfile_variant,cache_label,source,provenance,notes
+2026-07-27T02:57:53Z,2026-07-27T03:02:24Z,,success,e40264b07eb9,45.2GB,single-stage-with-recursive-chmod,cold,reconstructed,"end_utc from docker image Created; start from operator log",Superseded. Final `chmod -R a+rX /opt/coinrun` layer took 77.9s and added 12.8GB; export 26.2s. This is the size regression that motivated the multi-stage rewrite.
+,,,canceled,,,single-stage-with-uv-cache-prune,warm-partial,reconstructed,"no reliable timestamps captured",Backgrounded attempt whose docker client exited. Believed cancelled at the time; see the next row -- a build process tree from this launch was in fact still running later.
+2026-07-27T03:17:03Z,2026-07-27T03:26:17Z,554,canceled,,,single-stage-with-uv-cache-prune,warm-partial,reconstructed,"end from operator observation; start derived as end minus the observed 554s stage duration",Foreground attempt cancelled by a 10-minute tool timeout while still downloading jax[cuda12] wheels in the uv sync layer. No image produced.
+,2026-07-27T03:28:13Z,,success,0610c1953e26,26GB,multi-stage-no-chmod,warm,reconstructed,"end_utc from docker image Created; start not recorded",First multi-stage build. Reused 11 cached layers and collapsed /opt/coinrun to a single 6.38GB layer -- the 45.2GB -> 26GB reduction. Now untagged; superseded by the wrapper build below. Start time unknown; do not infer it from the wrapper run, which began later at 03:29:55Z.
+,,,terminated,,,,,reconstructed,"observed live by the operator around 03:29-03:30Z; PIDs 1130211/1130217/1130257/1130439",A stale build process tree from the backgrounded launch above was still active in uv sync at ~03:29-03:30Z and was then terminated. Verified gone afterwards (no docker build/buildx/uv processes, no build containers). Its own start/end times were never captured. It is a separate event from the 0610c1953e26 success.
