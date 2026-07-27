@@ -22,12 +22,11 @@ they resolve to the same required semantic value; conflicting aliases fail.
 
 The evaluator never samples a dataloader. It scans the manifest-declared
 ArrayRecord shards in deterministic order and identifies an episode by
-source+level identity. It encodes only the 32 true context frames. Each of the
-32 generated steps rebuilds a one-step dynamics rollout from the latest 32
-true-or-predicted latent/action pairs. Thus the dynamics KV cache is exactly
-the checkpoint context length, predictions feed back in latent space, and no
-future RGB is encoded or teacher-forced. H=1 and H=8 are metrics over prefixes
-of that single H=32 rollout.
+source+level identity. It encodes only the 32 true context frames. A single
+H=32 dynamics scan uses the model's 32-row ring KV cache, so generated states
+replace old context states as the window advances. Predictions feed back in
+latent space and no future RGB is encoded or teacher-forced. H=1 and H=8 are
+metrics over prefixes of that single H=32 rollout.
 
 Predicted latents are exported as direct, unnormalized tokenizer bottleneck
 values converted to float32. This is an exact representation of bfloat16 or
@@ -1781,11 +1780,11 @@ def run(args: Args) -> Path:
         tempfile.mkdtemp(prefix=f".{result_path.name}.tmp-", dir=output_root)
     )
 
-    def model_step(
-        latent_window: np.ndarray,
-        action_window: np.ndarray,
-        next_action: int,
-        _step: int,
+    def model_rollout(
+        context_latents: np.ndarray,
+        context_actions: np.ndarray,
+        future_actions: np.ndarray,
+        *,
         seed: int,
     ) -> np.ndarray:
         low = np.uint32(seed & 0xFFFFFFFF)
@@ -1794,19 +1793,29 @@ def run(args: Args) -> Path:
         result = latent_rollout(
             dynamics,
             actions_future=Actions(
-                categorical=jnp.asarray([[next_action]], dtype=jnp.int32)
+                categorical=jnp.asarray(future_actions[None], dtype=jnp.int32)
             ),
             schedule=schedule,
-            latents_ctx=jnp.asarray(latent_window[None]),
+            # Dynamics projections run in bfloat16 for this checkpoint.
+            # Matching that compute dtype keeps static KV caches portable
+            # between Ampere and Hopper GPUs.
+            latents_ctx=jnp.asarray(context_latents[None], dtype=jnp.bfloat16),
             actions_ctx=Actions(
-                categorical=jnp.asarray(action_window[None], dtype=jnp.int32)
+                categorical=jnp.asarray(context_actions[None], dtype=jnp.int32)
             ),
-            num_steps=1,
+            num_steps=MAX_HORIZON,
             rng=rng,
             use_kv_cache=True,
         )
-        # latent_rollout creates min(32 + 1, checkpoint_context) = 32 cache rows.
-        return np.asarray(jax.device_get(result["latents"][0, -1]))
+        predicted = np.asarray(
+            jax.device_get(result["latents"][0, CONTEXT:])
+        )
+        if predicted.shape[0] != MAX_HORIZON:
+            raise PairedAnchorError(
+                "dynamics rollout did not return exactly "
+                f"{MAX_HORIZON} generated latent rows"
+            )
+        return predicted.astype(np.float32)
 
     metric_rows: list[Mapping[str, Any]] = []
     anchor_summaries: list[Mapping[str, Any]] = []
@@ -1834,42 +1843,35 @@ def run(args: Args) -> Path:
                         f"anchor {anchor.anchor_id} tokenizer emitted nonfinite latents"
                     )
 
-                predicted_latents = sliding_window_rollout(
+                rollout_seed = derive_step_seed(
+                    benchmark_seed,
+                    anchor.anchor_id,
+                    "dynamics",
+                    0,
+                )
+                predicted_latents = model_rollout(
                     context_latents,
                     window.context_actions,
                     window.future_actions,
-                    max_context=CONTEXT,
-                    benchmark_seed=benchmark_seed,
-                    anchor_id=anchor.anchor_id,
-                    step_fn=model_step,
-                ).astype(np.float32)
+                    seed=rollout_seed,
+                )
                 permuted_actions = permute_actions(window.future_actions)
-                permuted_latents = sliding_window_rollout(
+                permuted_latents = model_rollout(
                     context_latents,
                     window.context_actions,
                     permuted_actions,
-                    max_context=CONTEXT,
-                    benchmark_seed=benchmark_seed,
-                    anchor_id=anchor.anchor_id,
-                    step_fn=model_step,
-                ).astype(np.float32)
-
-                combined = np.concatenate(
-                    (context_latents.astype(np.float32), predicted_latents),
-                    axis=0,
-                )
-                combined_permuted = np.concatenate(
-                    (context_latents.astype(np.float32), permuted_latents),
-                    axis=0,
+                    seed=rollout_seed,
                 )
                 decoded = np.asarray(
-                    jax.device_get(decode_jit(tokenizer, jnp.asarray(combined[None])))
-                )[0, CONTEXT:]
+                    jax.device_get(
+                        decode_jit(tokenizer, jnp.asarray(predicted_latents[None]))
+                    )
+                )[0]
                 decoded_permuted = np.asarray(
                     jax.device_get(
-                        decode_jit(tokenizer, jnp.asarray(combined_permuted[None]))
+                        decode_jit(tokenizer, jnp.asarray(permuted_latents[None]))
                     )
-                )[0, CONTEXT:]
+                )[0]
                 if not np.isfinite(decoded).all() or not np.isfinite(
                     decoded_permuted
                 ).all():
@@ -1938,15 +1940,19 @@ def run(args: Args) -> Path:
                     "rng": {
                         "derivation": (
                             "SHA256(canonical JSON of schema, benchmark seed, "
-                            "anchor id, stream='dynamics', and step), first 64 bits"
+                            "anchor id, stream='dynamics', and step=0), first "
+                            "64 bits; model scan splits the root key per step"
                         ),
                         "benchmark_seed": benchmark_seed,
-                        "true_and_action_permuted_use_identical_step_seeds": True,
+                        "true_and_action_permuted_use_identical_rollout_rng": True,
                     },
                     "rollout": {
                         "context_length": CONTEXT,
                         "max_horizon": MAX_HORIZON,
                         "dynamics_kv_cache_rows": CONTEXT,
+                        "dynamics_cache_policy": (
+                            "native ring cache retains the latest 32 rows"
+                        ),
                         "teacher_forcing_after_prediction_start": False,
                         "future_truth_encoded": False,
                         "predicted_rgb_reencoded": False,
