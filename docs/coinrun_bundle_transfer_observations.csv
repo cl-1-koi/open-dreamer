@@ -5,3 +5,4 @@ started_utc,source,destination,payload_bytes,elapsed_seconds,bytes_transferred,o
 2026-07-27T04:35:11Z,local-a10,runpod-h200,3000764892,111,4718592,operator_aborted,42510,"Pod endpoint appeared after approximately 278 seconds; transfer was aborted after the sustained rate implied roughly 19.6 hours for the archive. Host sar observed approximately 50.58 KB/s outbound."
 ,local-a10,hetzner-cloud-fw-w1,67108864,11.05,67108864,success,6073209,"Start time was not captured. 64 MiB incompressible slice of the bundle; one-file rsync with --whole-file."
 ,local-a10,hetzner-robot-fw-robot1,67108864,8.36,67108864,success,8027376,"Start time was not captured. 64 MiB incompressible slice of the bundle; one-file rsync with --whole-file. Selected as the staging relay."
+,local-a10,hetzner-robot-fw-robot1,3000767065,247.17,3000767065,success,12140515,"Start time was not captured. Full archive plus checked-in manifest; remote SHA-256 and byte sizes verified."
