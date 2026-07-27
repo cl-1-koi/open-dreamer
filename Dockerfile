@@ -111,11 +111,23 @@ RUN uv run --isolated --script ./generate_coinrun_dataset.py \
 # only what the offline Procgen smoke needs -- the source-built Procgen wheel
 # plus the isolated script's own wheels (gym3, numpy<2, tyro). Pruning would
 # delete the latter and force a network install on the pod.
-RUN mkdir -p /opt/coinrun/bin \
-    && cp /usr/local/bin/uv /opt/coinrun/bin/uv \
-    && rm -rf /opt/coinrun/build \
-    && test -x /opt/coinrun/bin/uv \
-    && test -n "$(find /opt/coinrun/uv-cache -name libenv.so -print -quit)"
+RUN set -eu; \
+    mkdir -p /opt/coinrun/bin /opt/coinrun/runtime-libs; \
+    cp /usr/local/bin/uv /opt/coinrun/bin/uv; \
+    libenv="$(find /opt/coinrun/uv-cache -name libenv.so -print -quit)"; \
+    ldd "$libenv" \
+      | awk '/=> \\/.* \\(0x/ { print $3 }' \
+      | while IFS= read -r library; do \
+          case "$(basename "$library")" in \
+            libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|libresolv.so.*|libutil.so.*) \
+              continue ;; \
+          esac; \
+          cp -L "$library" "/opt/coinrun/runtime-libs/$(basename "$library")"; \
+        done; \
+    rm -rf /opt/coinrun/build; \
+    test -x /opt/coinrun/bin/uv; \
+    test -s /opt/coinrun/runtime-libs/libQt5Gui.so.5; \
+    ! LD_LIBRARY_PATH=/opt/coinrun/runtime-libs ldd "$libenv" | grep -q "not found"
 
 
 # --------------------------------------------------------------------------
@@ -150,8 +162,9 @@ COPY --from=builder /opt/coinrun /opt/coinrun
 COPY scripts/coinrun_runner.py /opt/coinrun/runner/coinrun_runner.py
 RUN nvidia_libs="$(find /opt/coinrun/venv/lib/python3.11/site-packages/nvidia \
         -type d -name lib -print 2>/dev/null | sort | paste -sd: -)" \
+    && runtime_libs="/opt/coinrun/runtime-libs${nvidia_libs:+:$nvidia_libs}" \
     && printf '#!/bin/sh\nexport LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\nexec /opt/coinrun/venv/bin/python /opt/coinrun/runner/coinrun_runner.py "$@"\n' \
-      "$nvidia_libs" \
+      "$runtime_libs" \
       > /usr/local/bin/coinrun-runner \
     && chmod 0755 /usr/local/bin/coinrun-runner
 

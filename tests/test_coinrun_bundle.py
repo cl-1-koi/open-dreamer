@@ -413,6 +413,12 @@ class BundleShimTests(unittest.TestCase):
         self.assertIn('ln -sfn "$target/bin/uv" /usr/local/bin/uv', script)
         self.assertIn('"$target/bin/uv" --version', script)
 
+    def test_remote_setup_adds_procgen_and_nvidia_libraries_to_the_loader_path(self):
+        script = rc.REMOTE_BUNDLE_SETUP
+        self.assertIn('$target/runtime-libs/libQt5Gui.so.5', script)
+        self.assertIn('runtime_libs="$target/runtime-libs${nvidia_libs:+:$nvidia_libs}"', script)
+        self.assertIn("LD_LIBRARY_PATH=$runtime_libs", script)
+
     def test_remote_setup_recreates_the_runner_shim(self):
         # /usr/local/bin/coinrun-runner is built outside /opt/coinrun, so the
         # bundle cannot carry it; setup must recreate it or the documented

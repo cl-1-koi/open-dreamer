@@ -136,6 +136,11 @@ class DockerfileContractTests(unittest.TestCase):
         self.assertIn("cp /usr/local/bin/uv /opt/coinrun/bin/uv", self.text)
         self.assertIn("test -x /opt/coinrun/bin/uv", self.text)
 
+    def test_bundle_tree_carries_procgens_non_glibc_library_closure(self):
+        self.assertIn("/opt/coinrun/runtime-libs", self.text)
+        self.assertIn("libQt5Gui.so.5", self.text)
+        self.assertIn('LD_LIBRARY_PATH=/opt/coinrun/runtime-libs ldd "$libenv"', self.text)
+
     def test_build_fails_when_lock_hash_arg_does_not_match_copied_lock(self):
         self.assertIn('test "$(sha256sum uv.lock | cut -d\' \' -f1)" = "${UV_LOCK_SHA256}"', self.text)
 

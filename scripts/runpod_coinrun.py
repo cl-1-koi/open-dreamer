@@ -1486,12 +1486,12 @@ printf '#!/bin/sh\nexec %s/venv/bin/python "${COINRUN_CHECKOUT_ROOT:-/workspace/
 # is present on disk but invisible, and JAX silently falls back to CPU.
 python_lib="$target/venv/lib/python3.11/site-packages"
 nvidia_libs="$(find "$python_lib/nvidia" -type d -name lib -print 2>/dev/null | sort | paste -sd: -)"
-if [ -n "$nvidia_libs" ]; then
-  sed -i "2i export LD_LIBRARY_PATH=$nvidia_libs\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" \
-    /usr/local/bin/coinrun-runner
-fi
+test -s "$target/runtime-libs/libQt5Gui.so.5" || { echo "Procgen runtime libraries missing" >&2; exit 18; }
+runtime_libs="$target/runtime-libs${nvidia_libs:+:$nvidia_libs}"
+sed -i "2i export LD_LIBRARY_PATH=$runtime_libs\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" \
+  /usr/local/bin/coinrun-runner
 chmod 0755 /usr/local/bin/coinrun-runner
-command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 18; }
+command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 19; }
 
 echo "bundle verified and installed at $target"
 """
