@@ -517,6 +517,60 @@ class CommandConstructionTests(unittest.TestCase):
         self.assertIn("--append-verify", command)
         self.assertEqual(command[-1], "root@1.2.3.4:/workspace/x/")
 
+    def test_relay_ssh_uses_batch_mode(self):
+        command = rc.relay_ssh_command("fw-robot1", ["true"])
+        self.assertIn("BatchMode=yes", command)
+        self.assertEqual(command[-2:], ["fw-robot1", "true"])
+
+    def test_relay_bundle_is_validated_against_local_manifest(self):
+        captured = {}
+
+        def runner(command, **kwargs):
+            captured["command"] = command
+            captured["input"] = kwargs["input"]
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            plan = plan_for(root, manifest_path, bundle_dir)
+            rc.validate_relay_bundle(
+                "fw-robot1", "/root/coinrun-bundles", plan, runner=runner
+            )
+            manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        command_text = " ".join(captured["command"])
+        self.assertIn("fw-robot1", command_text)
+        self.assertIn(manifest["archive"]["sha256"], command_text)
+        self.assertIn(manifest_sha, command_text)
+        self.assertIn("sha256sum", captured["input"])
+
+    def test_relay_transfer_removes_ephemeral_key_after_failure(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            if any(part.startswith("rsync ") for part in command):
+                return subprocess.CompletedProcess(command, 23, "", "network failed")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, _, _ = write_bundle(root)
+            plan = plan_for(root, manifest_path, bundle_dir)
+            key = root / "ephemeral"
+            key.write_text("private key\n", encoding="utf-8")
+            with self.assertRaises(rc.DeploymentError) as caught:
+                rc.transfer_bundle_via_relay(
+                    "fw-robot1", "/root/coinrun-bundles", "1.2.3.4", 40022,
+                    pod_id="pod-1", key=key, plan=plan, runner=runner,
+                )
+        self.assertIn("relay rsync failed", str(caught.exception))
+        cleanup = calls[-1]
+        cleanup_text = " ".join(cleanup)
+        self.assertIn("rm", cleanup_text)
+        self.assertIn("/tmp/coinrun-relay-pod-1.key", cleanup_text)
+        self.assertIn("/tmp/coinrun-relay-pod-1.known_hosts", cleanup_text)
+
     def test_remote_setup_verifies_hash_size_and_procgen(self):
         script = rc.REMOTE_BUNDLE_SETUP
         self.assertIn("sha256sum", script)

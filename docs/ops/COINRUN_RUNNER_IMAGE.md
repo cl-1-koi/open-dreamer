@@ -112,14 +112,41 @@ sudo docker pull runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404
 
 Measured on this host: 6.91 GB tar → 3.00 GB `.tar.zst` in 188 s at level 9.
 
-### 2. Dry run (validates everything locally, launches nothing)
+### 2. Stage the package and create an ephemeral pod key
+
+The archive is sent directly and is never checked in. On this host,
+local-to-RunPod egress was unusably slow, while staging the 3.00 GB package on
+`fw-robot1` took 247 seconds:
+
+```bash
+ssh fw-robot1 'mkdir -p /root/coinrun-bundles'
+rsync --archive --partial --append-verify --compress-level=0 \
+  artifacts/coinrun_bundle/coinrun-opt-195069f66bce.tar.zst \
+  manifests/coinrun_runner_bundle.json \
+  fw-robot1:/root/coinrun-bundles/
+
+# Use a fresh key for this pod. The relay receives it only for the transfer and
+# the launcher removes its relay copy in a finally path.
+mkdir -p artifacts/runpod_coinrun
+ssh-keygen -q -t ed25519 -N '' \
+  -f artifacts/runpod_coinrun/pod-transfer-key
+```
+
+The launcher validates size and SHA-256 of both staged files against the local
+manifest before creating paid compute. The original package remains available
+locally and on the operator-owned relay; neither copy is a Git object.
+
+### 3. Dry run (validates everything locally, launches nothing)
 
 ```bash
 python scripts/runpod_coinrun.py launch \
   --transport bundle --gpu H200 \
   --preflight-report artifacts/coinrun_preflight/telemetry.json \
   --runtime-seconds 300 --setup-timeout-seconds 1200 \
-  --ssh-key ~/.ssh/id_ed25519 --ssh-public-key ~/.ssh/id_ed25519.pub \
+  --bundle-relay-host fw-robot1 \
+  --bundle-relay-dir /root/coinrun-bundles \
+  --ssh-key artifacts/runpod_coinrun/pod-transfer-key \
+  --ssh-public-key artifacts/runpod_coinrun/pod-transfer-key.pub \
   --experiment-command 'coinrun-runner smoke --artifact-dir=$COINRUN_ARTIFACT_DIR'
 ```
 
@@ -129,7 +156,7 @@ it, that the extract target is `/opt/coinrun`, that the archive filename is not
 a traversal, and that the archive's size **and** SHA-256 match. Add `--execute`
 to launch.
 
-### 3. What the pod does
+### 4. What the pod does
 
 1. Boots the pinned base by digest with `ports: ["8000/http", "22/tcp"]`,
    `supportPublicIp`, and `PUBLIC_KEY` in env — no account credential is ever
@@ -139,8 +166,12 @@ to launch.
    paid-work deadline, then `exec /start.sh` so sshd comes up. The pod is
    bounded from boot, so a local crash cannot leave it running.
 3. The launcher polls REST `publicIp` + `portMappings["22"]`, waits for sshd,
-   rsyncs (`--partial --append-verify`, resumable) the archive and manifest to
-   `/workspace/coinrun-bundle` using a **pod-specific** `known_hosts`.
+   and asks the selected relay to rsync (`--partial --append-verify`,
+   resumable) the archive and manifest directly to
+   `/workspace/coinrun-bundle`. The relay receives the pod's ephemeral private
+   key only for this operation and removes it and its pod-specific
+   `known_hosts` file even if rsync fails. Without `--bundle-relay-host`, the
+   original local-to-pod path remains available.
 4. Remotely verifies the size and SHA-256 of *both* files against values
    computed locally, extracts atomically into `/opt/coinrun` (`.incoming` then
    rename), and checks `venv/bin/python`, a `jax/flax/optax` import, and the
@@ -149,7 +180,7 @@ to launch.
    (verifying its bytes and hash), then starts it in a second call. The
    existing HTTP log/artifact monitor on port 8000 is unchanged.
 
-### 4. Budgets and cost
+### 5. Budgets and cost
 
 `--setup-timeout-seconds` (default 1200, max 3600) bounds everything up to the
 moment the experiment starts. It is added to `--runtime-seconds` for the
@@ -159,7 +190,7 @@ absolute remote deadline. The experiment itself is bounded by exactly
 
 Any setup failure raises, and the existing automatic-termination path runs.
 
-### 5. Transfer telemetry
+### 6. Transfer telemetry
 
 Appended to `artifacts/coinrun_bundle/transfer_telemetry.jsonl` and mirrored in
 the launcher state under `bundle_transfer`: `launch_to_endpoint_seconds`,
@@ -171,7 +202,7 @@ Small, manually verified historical transfer probes are tracked in
 `docs/coinrun_bundle_transfer_observations.csv`. The archive itself remains
 untracked; only its manifest and hashes belong in Git.
 
-### 6. Recovery and reconstruction
+### 7. Recovery and reconstruction
 
 The archive is deliberately not committed. To recover it from a clean checkout:
 
@@ -189,7 +220,7 @@ contents. Expect a different `archive.sha256` with the same behaviour; the
 `source.dockerfile_sha256`, `source.uv_lock_sha256` and `base_image.digest`
 fields are what make the rebuild verifiable.
 
-### 7. Provenance vs. compatibility (do not chase HEAD)
+### 8. Provenance vs. compatibility (do not chase HEAD)
 
 `source.commit` and `COINRUN_SOURCE_COMMIT` are **provenance**: they say which
 commit the environment was built from. They are *not* a runtime-identity check

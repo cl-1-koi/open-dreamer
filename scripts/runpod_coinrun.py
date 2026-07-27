@@ -1252,6 +1252,170 @@ def rsync_command(
     ]
 
 
+def relay_ssh_command(
+    relay_host: str,
+    remote: Sequence[str] | None = None,
+) -> list[str]:
+    """SSH to an operator-owned relay through the local OpenSSH config."""
+
+    command = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=15",
+        relay_host,
+    ]
+    if remote:
+        # OpenSSH concatenates all arguments after the host and asks a remote
+        # shell to parse them. Quote the complete argv here so values such as
+        # rsync's multi-word `-e` transport remain one argument remotely.
+        command.append(" ".join(shlex.quote(part) for part in remote))
+    return command
+
+
+def validate_relay_bundle(
+    relay_host: str,
+    relay_dir: str,
+    plan: BundlePlan,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    """Fail closed if the relay does not contain the exact manifest payload."""
+
+    archive = plan.manifest["archive"]
+    expected = (
+        (str(archive["filename"]), str(archive["sha256"]), str(archive["bytes"])),
+        (
+            plan.manifest_path.name,
+            sha256_file(plan.manifest_path),
+            str(plan.manifest_path.stat().st_size),
+        ),
+    )
+    script = r"""
+set -Eeuo pipefail
+root="$1"
+shift
+while [ "$#" -gt 0 ]; do
+  name="$1" want_sha="$2" want_bytes="$3"
+  shift 3
+  path="$root/$name"
+  test -f "$path"
+  test "$(stat -c %s "$path")" = "$want_bytes"
+  test "$(sha256sum "$path" | cut -d' ' -f1)" = "$want_sha"
+done
+"""
+    arguments = [item for triple in expected for item in triple]
+    result = runner(
+        relay_ssh_command(
+            relay_host,
+            ["bash", "-s", "--", relay_dir, *arguments],
+        ),
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[:400]
+        raise DeploymentError(
+            f"relay {relay_host} does not contain the manifest-selected bundle"
+            f" (exit {result.returncode}): {detail}"
+        )
+
+
+def transfer_bundle_via_relay(
+    relay_host: str,
+    relay_dir: str,
+    host: str,
+    port: int,
+    *,
+    pod_id: str,
+    key: Path,
+    plan: BundlePlan,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout: float | None = None,
+) -> None:
+    """Push a pre-staged bundle from the relay without routing bytes locally.
+
+    The private key authorises only this pod when the documented ephemeral-key
+    workflow is used. It is installed with mode 0600 and removed, together with
+    the pod-specific known_hosts file, even when rsync fails.
+    """
+
+    token = re.sub(r"[^a-zA-Z0-9_.-]", "_", pod_id)
+    remote_key = f"/tmp/coinrun-relay-{token}.key"
+    remote_known_hosts = f"/tmp/coinrun-relay-{token}.known_hosts"
+    install_script = r"""
+set -Eeuo pipefail
+target="$1"
+umask 077
+cat > "$target"
+chmod 0600 "$target"
+"""
+    archive = plan.manifest["archive"]
+    sources = [
+        f"{relay_dir.rstrip('/')}/{archive['filename']}",
+        f"{relay_dir.rstrip('/')}/{plan.manifest_path.name}",
+    ]
+    pod_ssh = " ".join(
+        shlex.quote(part)
+        for part in [
+            "ssh", "-p", str(port), "-i", remote_key,
+            "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"UserKnownHostsFile={remote_known_hosts}",
+            "-o", "ConnectTimeout=15",
+            "-o", "BatchMode=yes",
+        ]
+    )
+    relay_command = [
+        "rsync", "--archive", "--partial", "--append-verify",
+        "--compress-level=0", "--timeout=120",
+        "-e", pod_ssh, *sources,
+        f"{SSH_USER}@{host}:{REMOTE_STAGING_DIR}/",
+    ]
+    try:
+        installed = runner(
+            relay_ssh_command(
+                relay_host,
+                ["bash", "-s", "--", remote_key],
+            ),
+            input=key.read_text(encoding="utf-8"),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        if installed.returncode != 0:
+            raise DeploymentError(
+                f"could not install the ephemeral pod key on relay {relay_host}: "
+                f"{(installed.stderr or installed.stdout).strip()[:300]}"
+            )
+        transferred = runner(
+            relay_ssh_command(relay_host, relay_command),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+        if transferred.returncode != 0:
+            raise DeploymentError(
+                f"relay rsync failed (exit {transferred.returncode}): "
+                f"{(transferred.stderr or transferred.stdout).strip()[:400]}"
+            )
+    finally:
+        runner(
+            relay_ssh_command(
+                relay_host,
+                ["rm", "-f", remote_key, remote_known_hosts],
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+
+
 REMOTE_SCRIPT_INSTALL = r"""
 set -Eeuo pipefail
 target="$1"
@@ -1423,20 +1587,34 @@ def perform_bundle_setup(
         )
 
     transfer_started = clock()
-    for source in (plan.archive_path, plan.manifest_path):
-        transfer = runner(
-            rsync_command(
-                source, host, port, key=key, known_hosts=known_hosts,
-                destination=f"{REMOTE_STAGING_DIR}/",
-            ),
-            capture_output=True, text=True, check=False,
+    relay_host = str(getattr(args, "bundle_relay_host", "") or "").strip()
+    if relay_host:
+        transfer_bundle_via_relay(
+            relay_host,
+            str(args.bundle_relay_dir),
+            host,
+            port,
+            pod_id=pod_id,
+            key=key,
+            plan=plan,
+            runner=runner,
             timeout=max(1.0, setup_deadline - clock()),
         )
-        if transfer.returncode != 0:
-            raise DeploymentError(
-                f"rsync of {source.name} failed (exit {transfer.returncode}): "
-                f"{transfer.stderr.strip()[:400]}"
+    else:
+        for source in (plan.archive_path, plan.manifest_path):
+            transfer = runner(
+                rsync_command(
+                    source, host, port, key=key, known_hosts=known_hosts,
+                    destination=f"{REMOTE_STAGING_DIR}/",
+                ),
+                capture_output=True, text=True, check=False,
+                timeout=max(1.0, setup_deadline - clock()),
             )
+            if transfer.returncode != 0:
+                raise DeploymentError(
+                    f"rsync of {source.name} failed (exit {transfer.returncode}): "
+                    f"{transfer.stderr.strip()[:400]}"
+                )
     transfer_seconds = clock() - transfer_started
     transfer_bytes = plan.archive_path.stat().st_size + plan.manifest_path.stat().st_size
 
@@ -1512,6 +1690,7 @@ def perform_bundle_setup(
         "transfer_seconds": round(transfer_seconds, 3),
         "transfer_bytes": transfer_bytes,
         "transfer_bytes_per_second": round(transfer_bytes / max(transfer_seconds, 1e-6), 1),
+        "transfer_source": f"relay:{relay_host}" if relay_host else "local",
         "remote_verify_extract_seconds": round(verify_seconds, 3),
         "experiment_started_utc": isoformat(utc_now()),
         "setup_seconds": round(total, 3),
@@ -1927,6 +2106,13 @@ def run_launch(
         public_key = read_public_key(Path(args.ssh_public_key))
         if not Path(args.ssh_key).expanduser().is_file():
             raise DeploymentError(f"SSH private key not found: {args.ssh_key}")
+        relay_host = str(getattr(args, "bundle_relay_host", "") or "").strip()
+        if relay_host:
+            validate_relay_bundle(
+                relay_host,
+                str(args.bundle_relay_dir),
+                plan,
+            )
         image_reference = {"reference": plan.base_image, "kind": "digest"}
     else:
         image_reference = validate_image_reference(args.image)
@@ -2293,6 +2479,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch.add_argument("--bundle-manifest", type=Path, default=DEFAULT_BUNDLE_MANIFEST)
     launch.add_argument("--bundle-dir", type=Path, default=DEFAULT_BUNDLE_DIR)
+    launch.add_argument(
+        "--bundle-relay-host",
+        default="",
+        help=(
+            "Optional SSH-config host containing a pre-staged copy of the "
+            "manifest-selected archive. The relay pushes directly to the pod."
+        ),
+    )
+    launch.add_argument(
+        "--bundle-relay-dir",
+        default="/root/coinrun-bundles",
+        help="Directory on --bundle-relay-host containing the archive and manifest.",
+    )
     launch.add_argument("--ssh-key", type=Path, default=Path("~/.ssh/id_ed25519"))
     launch.add_argument(
         "--ssh-public-key", type=Path, default=Path("~/.ssh/id_ed25519.pub")
@@ -2348,6 +2547,12 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_cli_args(args: argparse.Namespace) -> None:
     if args.command != "launch":
         return
+    relay_host = str(getattr(args, "bundle_relay_host", "") or "").strip()
+    if relay_host and (
+        relay_host.startswith("-")
+        or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", relay_host)
+    ):
+        raise DeploymentError("--bundle-relay-host is not a safe SSH host or alias")
     if getattr(args, "transport", "image") == "bundle":
         validate_setup_timeout(args.setup_timeout_seconds)
         if args.image is not None:
@@ -2355,7 +2560,19 @@ def validate_cli_args(args: argparse.Namespace) -> None:
                 "--image is meaningless with --transport bundle; the base image "
                 "comes from the manifest's pinned digest"
             )
+        if relay_host and not str(args.bundle_relay_dir).strip():
+            raise DeploymentError(
+                "--bundle-relay-dir must be nonempty when a relay is selected"
+            )
+        if relay_host and not str(args.bundle_relay_dir).startswith("/"):
+            raise DeploymentError(
+                "--bundle-relay-dir must be an absolute path on the relay"
+            )
     else:
+        if relay_host:
+            raise DeploymentError(
+                "--bundle-relay-host is meaningful only with --transport bundle"
+            )
         if args.image is None:
             raise DeploymentError("--image is required with --transport image")
         validate_image_reference(args.image)
