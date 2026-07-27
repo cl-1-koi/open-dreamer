@@ -83,6 +83,20 @@ class CoinRunH100ExperimentScriptTests(unittest.TestCase):
             manifest = json.loads((artifact_dir / "final_manifest.json").read_text())
             self.assertEqual(manifest["active_preset"], "fallback")
 
+    def test_stage_functions_do_not_expand_locals_before_assignment(self):
+        script_text = SCRIPT.read_text()
+        for stage in ("tokenizer", "dynamics"):
+            unsafe = (
+                f'local preset="$1" '
+                f'run_dir="$ARTIFACT_DIR/{stage}_$preset"'
+            )
+            safe = (
+                'local preset="$1"\n'
+                f'  local run_dir="$ARTIFACT_DIR/{stage}_$preset"'
+            )
+            self.assertNotIn(unsafe, script_text)
+            self.assertIn(safe, script_text)
+
     def test_rejects_missing_artifact_directory_without_claiming_success(self):
         result = self.run_script("--dry-run", env={"COINRUN_ARTIFACT_DIR": ""})
 

@@ -437,7 +437,8 @@ cp "$LOG_DIR/dataset_validation.log" "$ARTIFACT_DIR/dataset_validation.json"
 printf 'passed: isolated Procgen random+scripted corpus with disjoint split seed ranges\n' > "$ARTIFACT_DIR/gates/dataset.txt"
 
 run_tokenizer() {
-  local preset="$1" run_dir="$ARTIFACT_DIR/tokenizer_$preset"
+  local preset="$1"
+  local run_dir="$ARTIFACT_DIR/tokenizer_$preset"
   select_preset "$preset"
   build_tokenizer_overrides "$run_dir"
   capture_config "tokenizer_config_$preset" tokenizer coinrun_tokenizer "${tokenizer_overrides[@]}" || return $?
@@ -499,7 +500,8 @@ run_heldout_probe() {
 run_heldout_probe || exit $?
 
 run_dynamics() {
-  local preset="$1" run_dir="$ARTIFACT_DIR/dynamics_$preset"
+  local preset="$1"
+  local run_dir="$ARTIFACT_DIR/dynamics_$preset"
   select_preset "$preset"
   build_dynamics_overrides "$run_dir" "$TOKENIZER_DIR/checkpoints" "$probe_path"
   capture_config "dynamics_config_$preset" dynamics coinrun_dynamics "${dynamics_overrides[@]}" || return $?
