@@ -219,6 +219,7 @@ def build_manifest(
     dockerfile_sha256: str,
     base_reference: str,
     base_digest: str,
+    build_inputs: dict[str, str],
     archive: Path,
     archive_facts: dict[str, Any],
     reference: str,
@@ -250,6 +251,12 @@ def build_manifest(
             "image_id": info["id"],
         },
         "base_image": {"reference": base_reference, "digest": base_digest},
+        # Hashes of the files that determine what ends up inside /opt/coinrun.
+        # scripts/coinrun_runner.py is shipped at /opt/coinrun/runner/, so the
+        # launcher gates on it. The Dockerfile and generator are recorded as
+        # rebuild triggers but not gated -- see the manifest section of
+        # docs/ops/COINRUN_RUNNER_IMAGE.md.
+        "build_inputs": build_inputs,
         "contract_env": contract_env,
         "build": {
             "command": " ".join(archive_command(["docker"], reference)),
@@ -272,6 +279,21 @@ def resolve_base(docker: Sequence[str], reference: str) -> tuple[str, str]:
             f"`docker pull {reference}` so the pinned digest can be recorded"
         )
     return reference, digests[0].split("@", 1)[1]
+
+
+# Recorded in every manifest. Only coinrun_runner_sha256 gates compatibility in
+# the launcher (that file is shipped inside the bundle); the others are rebuild
+# triggers an operator should think about, not automatic failures.
+BUILD_INPUTS = {
+    "uv_lock_sha256": "uv.lock",
+    "dockerfile_sha256": "Dockerfile",
+    "generator_sha256": "dreamer/data/generate_coinrun_dataset.py",
+    "coinrun_runner_sha256": "scripts/coinrun_runner.py",
+}
+
+
+def collect_build_inputs() -> dict[str, str]:
+    return {key: sha256_file(REPO_ROOT / path) for key, path in BUILD_INPUTS.items()}
 
 
 def append_telemetry(record: dict[str, Any]) -> None:
@@ -319,7 +341,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest = build_manifest(
             info=info, contract_env=contract_env, lock_sha256=lock_sha256,
             dockerfile_sha256=dockerfile_sha256, base_reference=base_reference,
-            base_digest=base_digest, archive=archive, archive_facts=facts,
+            base_digest=base_digest, build_inputs=collect_build_inputs(),
+            archive=archive, archive_facts=facts,
             reference=args.image, versions=tool_versions(docker),
             level=args.zstd_level,
         )

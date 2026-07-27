@@ -931,6 +931,11 @@ DEFAULT_BUNDLE_DIR = (
 DEFAULT_SETUP_TIMEOUT_SECONDS = 20 * 60
 MAX_SETUP_TIMEOUT_SECONDS = 60 * 60
 REMOTE_STAGING_DIR = "/workspace/coinrun-bundle"
+# Build inputs whose change invalidates an existing bundle. Enforced only when
+# the manifest records them, so manifests built before this field stay usable.
+GATED_BUNDLE_INPUTS = {
+    "scripts/coinrun_runner.py": "coinrun_runner_sha256",
+}
 SSH_USER = "root"
 
 
@@ -979,6 +984,32 @@ def validate_bundle_manifest(
         raise DeploymentError(
             "bundle manifest contract env disagrees with its own source lock hash"
         )
+
+    # Compatibility is about build inputs, never about matching HEAD. The
+    # manifest is itself checked in, so source.commit can never equal the
+    # commit that contains it -- runtime checkout identity is enforced
+    # separately by --expect-commit. Gate only on inputs that actually change
+    # what is inside /opt/coinrun:
+    #   uv.lock                   -> the venv (checked above)
+    #   scripts/coinrun_runner.py -> shipped at /opt/coinrun/runner/, so a stale
+    #                                bundle would run stale runner code
+    # The Dockerfile and the dataset generator are recorded as rebuild triggers
+    # but not gated: most edits to them (comments, layer order, labels, the
+    # generator's body, which runs from the checkout) leave the payload
+    # identical, and failing closed there would force no-op rebuilds.
+    inputs = manifest.get("build_inputs")
+    if isinstance(inputs, dict):
+        for relative_path, key in GATED_BUNDLE_INPUTS.items():
+            recorded = inputs.get(key)
+            if not recorded:
+                continue
+            actual = sha256_file(repo_root / relative_path)
+            if actual != recorded:
+                raise DeploymentError(
+                    f"bundle is stale: {relative_path} is {actual} but the bundle "
+                    f"was built from {recorded}; rebuild it with "
+                    "scripts/build_coinrun_bundle.py"
+                )
     if manifest["extract"].get("target") != IMAGE_ROOT:
         raise DeploymentError(
             f"bundle manifest extracts to {manifest['extract'].get('target')!r}, "
@@ -1242,6 +1273,13 @@ rm -rf "$target.incoming" "$target.old"
 test -x "$target/venv/bin/python" || { echo "venv python missing" >&2; exit 14; }
 "$target/venv/bin/python" -c 'import jax, flax, optax'   || { echo "venv imports failed" >&2; exit 15; }
 test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "Procgen libenv.so missing from the uv cache" >&2; exit 16; }
+# The image builds /usr/local/bin/coinrun-runner outside /opt/coinrun, so the
+# bundle cannot carry it. Recreate it from the payload we just installed.
+printf '#!/bin/sh\nexec %s/venv/bin/python %s/runner/coinrun_runner.py "$@"\n' \
+  "$target" "$target" > /usr/local/bin/coinrun-runner
+chmod 0755 /usr/local/bin/coinrun-runner
+command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 17; }
+
 echo "bundle verified and installed at $target"
 """
 

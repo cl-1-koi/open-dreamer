@@ -98,7 +98,8 @@ python scripts/build_coinrun_bundle.py --image coinrun-runner:slim
 
 It refuses to package an image whose `COINRUN_UV_LOCK_SHA256` and
 `io.coinrun.uv.lock.sha256` disagree, or that was built for a different
-`uv.lock` than this checkout. It writes the archive under
+`uv.lock` than this checkout. It does **not** care whether the image's commit
+equals HEAD — see "Provenance vs. compatibility" below. It writes the archive under
 `artifacts/coinrun_bundle/` (never committed), the manifest to
 `manifests/coinrun_runner_bundle.json` (committed), and package telemetry to
 `artifacts/coinrun_bundle/package_telemetry.jsonl`.
@@ -182,8 +183,43 @@ still contains absolute paths, `UV_COMPILE_BYTECODE=1` `.pyc` files whose
 headers embed source mtimes, and uv cache entries with build-time-dependent
 contents. Expect a different `archive.sha256` with the same behaviour; the
 `source.dockerfile_sha256`, `source.uv_lock_sha256` and `base_image.digest`
-fields are what make the rebuild verifiable. If you rebuild, commit the updated
-manifest — a stale manifest fails the launcher's hash check by design.
+fields are what make the rebuild verifiable.
+
+### 7. Provenance vs. compatibility (do not chase HEAD)
+
+`source.commit` and `COINRUN_SOURCE_COMMIT` are **provenance**: they say which
+commit the environment was built from. They are *not* a runtime-identity check
+and must never be required to equal the checkout you launch.
+
+The manifest is itself checked in, so committing an updated manifest always
+creates a newer HEAD. Requiring `source.commit == HEAD` is an impossible
+self-reference loop — the bundle would be stale the instant you recorded it.
+
+The two concerns are enforced separately:
+
+| Question | Enforced by |
+|---|---|
+| Is the pod running the exact code I pushed? | `--expect-commit` / the bootstrap's `git rev-parse HEAD` check |
+| Is this bundle valid for this checkout? | `uv.lock` SHA, plus the gated build inputs below |
+
+A bundle built at an older commit is **correct and expected** for a later
+checkout, as long as the build inputs match.
+
+#### Rebuild triggers
+
+Rebuild the image and the bundle when any of these change:
+
+| Input | Gated? | Why |
+|---|---|---|
+| `uv.lock` | **yes, fails closed** | Determines the venv contents |
+| `scripts/coinrun_runner.py` | **yes, fails closed** | Ships inside the bundle at `/opt/coinrun/runner/`, so a stale bundle runs stale runner code |
+| `Dockerfile` | recorded, not gated | Most edits (comments, layer order, labels) leave `/opt/coinrun` byte-identical; rebuild when you change apt packages, the `uv sync` flags, the prewarm, or the base |
+| `dreamer/data/generate_coinrun_dataset.py` | recorded, not gated | Only its PEP 723 header (the Procgen pin) affects the cached wheel; the body runs from the checkout at runtime |
+| `scripts/build_coinrun_bundle.py` | no | Packaging logic only; changes the archive, not its semantic content |
+
+Do **not** rebuild merely to advance `source.commit`. Gated hashes live under
+`build_inputs` in the manifest and are enforced only when present, so manifests
+written before that field remain usable.
 
 ## Image transport (legacy, optional)
 

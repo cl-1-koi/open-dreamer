@@ -270,6 +270,124 @@ class BundleBuilderTests(unittest.TestCase):
         self.assertIn("docker pull", str(caught.exception))
 
 
+class ProvenanceVersusCompatibilityTests(unittest.TestCase):
+    """source.commit is provenance, not a runtime-identity gate.
+
+    The manifest is checked in, so committing it always advances HEAD:
+    requiring source.commit == HEAD would be an impossible self-reference.
+    Runtime checkout identity is enforced separately by --expect-commit.
+    """
+
+    def test_older_source_commit_is_accepted_when_the_lock_is_identical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            # Bundle built at an older commit; the checkout has moved on.
+            manifest["source"]["commit"] = "1" * 40
+            manifest["contract_env"]["COINRUN_SOURCE_COMMIT"] = "1" * 40
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            plan = plan_for(root, manifest_path, bundle_dir)
+        self.assertEqual(plan.manifest["source"]["commit"], "1" * 40)
+
+    def test_the_lock_hash_is_what_actually_gates_compatibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            manifest["source"]["commit"] = "1" * 40
+            manifest["contract_env"]["COINRUN_SOURCE_COMMIT"] = "1" * 40
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            (root / "uv.lock").write_bytes(b"dependencies changed\n")
+            with self.assertRaises(rc.DeploymentError) as caught:
+                plan_for(root, manifest_path, bundle_dir)
+        self.assertIn("rebuild the bundle", str(caught.exception))
+
+    def test_lock_mismatch_is_rejected_before_pod_creation(self):
+        class Api:
+            def __init__(self):
+                self.created = []
+
+            def graphql(self, query):
+                raise AssertionError("discovery must not run")
+
+            def create_pod(self, payload):
+                self.created.append(payload)
+                raise AssertionError("create_pod must not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            manifest["source"]["commit"] = "1" * 40  # older build, fine on its own
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            (root / "uv.lock").write_bytes(b"dependencies changed\n")
+            config = root / "runpod.toml"
+            config.write_text('[default]\napi_key = "k"\n', encoding="utf-8")
+            key, pub = root / "id", root / "id.pub"
+            key.write_text("private", encoding="utf-8")
+            pub.write_text("ssh-ed25519 AAAA user@host\n", encoding="utf-8")
+            args = SimpleNamespace(
+                command="launch", state=root / "state.json", config=config,
+                repo_root=root, preflight_report=root / "telemetry.json",
+                gpu="H200", experiment_command="coinrun-runner experiment",
+                runtime_seconds=rc.MAX_RUNTIME_SECONDS, cloud="secure",
+                balance_buffer=Decimal("5"), image=None, container_disk_gb=100,
+                remote_artifact_dir="/workspace/coinrun-artifacts", poll_seconds=0.01,
+                max_artifact_bytes=1024, execute=True, transport="bundle",
+                bundle_manifest=manifest_path, bundle_dir=bundle_dir,
+                ssh_key=key, ssh_public_key=pub, setup_timeout_seconds=600,
+                transfer_telemetry=root / "transfer.jsonl",
+            )
+            api = Api()
+            with self.assertRaises(rc.DeploymentError):
+                rc.run_launch(args, api_factory=lambda k: api)
+            self.assertEqual(api.created, [])
+
+    def test_in_bundle_runner_source_gates_when_recorded(self):
+        # scripts/coinrun_runner.py ships at /opt/coinrun/runner/, so a stale
+        # bundle would run stale runner code.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "coinrun_runner.py").write_bytes(b"current\n")
+            manifest["build_inputs"] = {"coinrun_runner_sha256": "9" * 64}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(rc.DeploymentError) as caught:
+                plan_for(root, manifest_path, bundle_dir)
+        self.assertIn("bundle is stale", str(caught.exception))
+        self.assertIn("scripts/coinrun_runner.py", str(caught.exception))
+
+    def test_manifests_without_build_inputs_stay_usable(self):
+        # The checked-in manifest predates build_inputs; it must not break.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            self.assertNotIn("build_inputs", manifest)
+            plan_for(root, manifest_path, bundle_dir)
+
+    def test_dockerfile_and_generator_are_recorded_but_not_gated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            manifest["build_inputs"] = {
+                "dockerfile_sha256": "9" * 64,
+                "generator_sha256": "9" * 64,
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            plan_for(root, manifest_path, bundle_dir)  # must not raise
+        self.assertEqual(set(rc.GATED_BUNDLE_INPUTS), {"scripts/coinrun_runner.py"})
+
+
+class BundleShimTests(unittest.TestCase):
+    def test_remote_setup_recreates_the_runner_shim(self):
+        # /usr/local/bin/coinrun-runner is built outside /opt/coinrun, so the
+        # bundle cannot carry it; setup must recreate it or the documented
+        # experiment command is command-not-found on the pod.
+        script = rc.REMOTE_BUNDLE_SETUP
+        self.assertIn("/usr/local/bin/coinrun-runner", script)
+        self.assertIn("runner/coinrun_runner.py", script)
+        self.assertIn("command -v coinrun-runner", script)
+
+
 class PublicKeyTests(unittest.TestCase):
     def test_private_key_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
