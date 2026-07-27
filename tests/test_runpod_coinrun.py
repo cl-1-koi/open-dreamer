@@ -502,6 +502,15 @@ class LaunchFlowTests(unittest.TestCase):
                 api.create_calls[0]["gpuTypeIds"],
                 [runpod_coinrun.GPU_IDS["H200"]],
             )
+            self.assertEqual(
+                api.create_calls[0]["dockerEntrypoint"],
+                ["/bin/bash", "-lc"],
+            )
+            self.assertEqual(len(api.create_calls[0]["dockerStartCmd"]), 1)
+            self.assertIn(
+                "exec bash /tmp/run_coinrun.sh",
+                api.create_calls[0]["dockerStartCmd"][0],
+            )
             self.assertNotIn("top-secret", json.dumps(state))
             self.assertEqual(observed["phase"], "running")
 

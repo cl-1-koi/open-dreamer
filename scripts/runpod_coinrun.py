@@ -823,13 +823,12 @@ def build_remote_script(
     )
 
 
-def encode_start_command(remote_script: str) -> list[str]:
+def encode_start_command(remote_script: str) -> str:
     encoded = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
-    command = (
+    return (
         f"printf %s {shlex.quote(encoded)} | base64 -d "
         "> /tmp/run_coinrun.sh && exec bash /tmp/run_coinrun.sh"
     )
-    return ["bash", "-lc", command]
 
 
 def make_pod_payload(
@@ -863,7 +862,10 @@ def make_pod_payload(
         "volumeInGb": 0,
         "ports": ["8000/http"],
         "allowedCudaVersions": ["12.8", "12.9", "13.0"],
-        "dockerStartCmd": encode_start_command(remote_script),
+        # The RunPod PyTorch image has its own entrypoint. Override it as well
+        # as CMD so the bootstrap is executed rather than passed to /start.sh.
+        "dockerEntrypoint": ["/bin/bash", "-lc"],
+        "dockerStartCmd": [encode_start_command(remote_script)],
     }
 
 
