@@ -32,7 +32,7 @@ from typing import Any, Callable, Iterator, Sequence
 MAX_RUNTIME_SECONDS = 4 * 60 * 60
 MIN_RUNTIME_SECONDS = 5 * 60
 REMOTE_FINALIZATION_SECONDS = 120
-PROXY_STARTUP_GRACE_SECONDS = 10 * 60
+PROXY_STARTUP_GRACE_SECONDS = 20 * 60
 DEFAULT_CONFIG = Path.home() / ".runpod" / "config.toml"
 GITHUB_REPO_URL = "https://github.com/cl-1-koi/open-dreamer.git"
 POD_NAME_PREFIX = "coinrun-reconstruction-"
