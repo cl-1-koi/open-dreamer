@@ -28,7 +28,7 @@ from dreamer.configs import DynamicsConfig, OptimalTransportConfig
 from dreamer.data import build_dual_iterator
 from dreamer.logging import build_logger
 from dreamer.models import Dynamics, Tokenizer
-from dreamer.actions import Actions, shift_actions, NUM_BINARY_ACTIONS, NUM_CAMERA_CLASSES
+from dreamer.actions import Actions, shift_actions
 from dreamer.parallel import build_parallel, MeshRules
 from dreamer.scaling import ScalingContext
 from dreamer.training import (
@@ -166,7 +166,82 @@ def train_step(
 # Main
 # ---------------------------
 
+_ACTION_DIM_FIELDS = (
+    "num_binary_actions",
+    "categorical_action_dim",
+    "continuous_action_dim",
+)
+
+
+def validate_dynamics_config(cfg: DynamicsConfig) -> dict:
+    """Resolve the Hydra config and validate the dataset/model action contract."""
+    resolved = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    if not isinstance(resolved, dict):
+        raise TypeError(f"Expected a mapping config, got {type(resolved).__name__}.")
+
+    dataset_cfg = resolved.get("dataset")
+    dynamics_cfg = resolved.get("dynamics")
+    if not isinstance(dataset_cfg, dict) or not isinstance(dynamics_cfg, dict):
+        raise ValueError("Resolved config must contain mapping-valued dataset and dynamics sections.")
+
+    for field in _ACTION_DIM_FIELDS:
+        dataset_dim = dataset_cfg.get(field)
+        model_dim = dynamics_cfg.get(field)
+        for section, value in (("dataset", dataset_dim), ("dynamics", model_dim)):
+            if type(value) is not int or value < 0:
+                raise ValueError(
+                    f"{section}.{field} must be a non-negative integer; got {value!r}."
+                )
+        if dataset_dim != model_dim:
+            raise ValueError(
+                f"Resolved action dimension mismatch for {field}: "
+                f"dataset={dataset_dim}, dynamics={model_dim}."
+            )
+
+    return resolved
+
+
+def validate_action_batch(
+    actions: Actions,
+    cfg: DynamicsConfig,
+    batch_time_shape: tuple[int, int],
+) -> None:
+    """Reject missing, extra, or incorrectly shaped action modalities."""
+    B, T = batch_time_shape
+    expected_shapes = {
+        "binary": (B, T, cfg.dataset.num_binary_actions),
+        "categorical": (B, T),
+        "continuous": (B, T, cfg.dataset.continuous_action_dim),
+    }
+    configured_dims = {
+        "binary": cfg.dataset.num_binary_actions,
+        "categorical": cfg.dataset.categorical_action_dim,
+        "continuous": cfg.dataset.continuous_action_dim,
+    }
+
+    for field, configured_dim in configured_dims.items():
+        value = getattr(actions, field)
+        if configured_dim == 0:
+            if value is not None:
+                raise ValueError(
+                    f"Batch provides {field} actions, but its configured dimension is 0."
+                )
+            continue
+        if value is None:
+            raise ValueError(
+                f"Batch is missing {field} actions with configured dimension {configured_dim}."
+            )
+        actual_shape = tuple(value.shape)
+        expected_shape = expected_shapes[field]
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Expected {field} actions with shape {expected_shape}, got {actual_shape}."
+            )
+
+
 def run(cfg: DynamicsConfig):
+    resolved_cfg = validate_dynamics_config(cfg)
+
     # Setup
     run_dir, ckpt_dir, vis_dir = setup_training_directories(cfg)
 
@@ -180,7 +255,7 @@ def run(cfg: DynamicsConfig):
     is_multihost = jax.process_count() > 1
 
     # Logging
-    logger = build_logger(logger_cfg=cfg.logger, config=OmegaConf.to_container(cfg, resolve=True), dir=str(run_dir))
+    logger = build_logger(logger_cfg=cfg.logger, config=resolved_cfg, dir=str(run_dir))
 
     with logger, jax.set_mesh(mesh):
         key = jax.random.PRNGKey(cfg.seed)
@@ -191,8 +266,6 @@ def run(cfg: DynamicsConfig):
 
         # Check if using latent data (pre-tokenized)
         use_latent_data = cfg.dataset.data_type == "latent"
-        assert cfg.dataset.num_binary_actions == NUM_BINARY_ACTIONS
-        assert cfg.dataset.categorical_action_dim == NUM_CAMERA_CLASSES
 
         # Load pretrained tokenizer (required for video data, optional for latent data checkpoints)
         tokenizer_bundle = TokenizerCheckpointBundle.from_pretrained(cfg.tokenizer_ckpt, mesh_rules=mesh_rules)
@@ -271,6 +344,7 @@ def run(cfg: DynamicsConfig):
                 latents = batch.get("latents")
                 input_tensor = latents if latents is not None else videos
 
+                validate_action_batch(actions, cfg, input_tensor.shape[:2])
                 actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
 
                 # Validation/visualization — all hosts must participate in JAX

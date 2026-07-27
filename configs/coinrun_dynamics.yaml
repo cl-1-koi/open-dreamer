@@ -1,0 +1,65 @@
+# A10-safe CoinRun dynamics preflight:
+# `uv run scripts/train_dynamics.py --config-name coinrun_dynamics`
+
+defaults:
+  - dynamics
+  - override dataset: coinrun
+  - _self_
+
+run_name: coinrun-dynamics-smoke
+tokenizer_ckpt: logs/coinrun-tokenizer-smoke/checkpoints
+max_steps: 10
+
+dataset:
+  dataloader_cfg:
+    B: 2
+    num_workers: 2
+    prefetch_buffer_size: 2
+    device_prefetch_buffer_size: 1
+    short_T: 16
+    long_T: 16
+    long_ratio: 0.0
+
+ckpt:
+  max_to_keep: 1
+  save_interval_steps: 5
+
+logger:
+  log_every: 1
+
+dynamics:
+  d_bottleneck: 8
+  depth: 2
+  d_model: 128
+  n_heads: 4
+  n_kv_heads: 1
+  packing_factor: 2
+  n_register: 4
+  time_every: 2
+  time_layer_offset: 0
+  k_max: 8
+  context_length: 16
+  latent_mean: null
+  latent_std: null
+
+bootstrap_start: 100
+bootstrap_fraction: 0.25
+image_fraction: 0.0
+
+ot:
+  enabled: false
+
+loss_weighting: ramp
+
+lr_schedule:
+  schedule_type: constant
+  lr: 3e-4
+  warmup_ratio: 0.0
+  decay_ratio: 0.0
+
+optimizer:
+  optimizer_type: adamw
+  mup_scaling: false
+
+write_video_every: 0
+parallel_strategy: data

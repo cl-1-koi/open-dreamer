@@ -1,0 +1,58 @@
+# A10-safe CoinRun tokenizer preflight:
+# `uv run scripts/train_tokenizer.py --config-name coinrun_tokenizer`
+
+defaults:
+  - tokenizer
+  - override dataset: coinrun
+  - _self_
+
+run_name: coinrun-tokenizer-smoke
+max_steps: 10
+
+dataset:
+  dataloader_cfg:
+    B: 2
+    num_workers: 2
+    prefetch_buffer_size: 2
+    device_prefetch_buffer_size: 1
+    short_T: 16
+    long_T: 16
+    long_ratio: 0.0
+
+ckpt:
+  max_to_keep: 1
+  save_interval_steps: 5
+
+logger:
+  log_every: 1
+
+tokenizer:
+  encoder:
+    n_latents: 32
+    d_bottleneck: 8
+    depth: 2
+    d_model: 128
+    n_heads: 4
+    n_kv_heads: 1
+    time_every: 2
+    time_layer_offset: 1
+
+  decoder:
+    depth: 2
+    d_model: 128
+    n_heads: 4
+    n_kv_heads: 1
+
+lr_schedule:
+  schedule_type: constant
+  lr: 3e-4
+  warmup_ratio: 0.0
+  decay_ratio: 0.0
+
+optimizer:
+  optimizer_type: adamw
+  mup_scaling: false
+
+lpips_weight: 0.0
+visualize_every: 0
+parallel_strategy: data
