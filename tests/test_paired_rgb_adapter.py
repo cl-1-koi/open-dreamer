@@ -228,6 +228,16 @@ class PairedRgbAdapterTest(unittest.TestCase):
             (self.output_path / "manifest.json").read_text(encoding="utf-8")
         )
         self.assertEqual(stored_manifest, returned_manifest)
+        self.assertEqual(
+            stored_manifest["action_space"],
+            {
+                "categorical_action_dim": 9,
+                "categorical_noop": 4,
+                "continuous_action_dim": 0,
+                "num_binary_actions": 0,
+                "type": "procgen_discrete",
+            },
+        )
 
         for source_manifest in stored_manifest["sources"]:
             source_path = self.input_path / source_manifest["filename"]

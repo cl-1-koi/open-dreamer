@@ -516,6 +516,13 @@ def convert_paired_rgb_corpus(
         manifest = {
             "adapter_schema_version": ADAPTER_SCHEMA_VERSION,
             "action_alignment": "action_applied_after_frame",
+            "action_space": {
+                "categorical_action_dim": COINRUN_NUM_ACTIONS,
+                "categorical_noop": COINRUN_NOOP_ACTION,
+                "continuous_action_dim": 0,
+                "num_binary_actions": 0,
+                "type": "procgen_discrete",
+            },
             "input_contract": PAIRED_CONTRACT,
             "input_schema_version": PAIRED_SCHEMA_VERSION,
             "num_episodes": sum(source["num_episodes"] for source in source_manifests),
