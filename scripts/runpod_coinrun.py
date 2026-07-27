@@ -1345,13 +1345,6 @@ def transfer_bundle_via_relay(
     token = re.sub(r"[^a-zA-Z0-9_.-]", "_", pod_id)
     remote_key = f"/tmp/coinrun-relay-{token}.key"
     remote_known_hosts = f"/tmp/coinrun-relay-{token}.known_hosts"
-    install_script = r"""
-set -Eeuo pipefail
-target="$1"
-umask 077
-cat > "$target"
-chmod 0600 "$target"
-"""
     archive = plan.manifest["archive"]
     sources = [
         f"{relay_dir.rstrip('/')}/{archive['filename']}",
@@ -1378,7 +1371,11 @@ chmod 0600 "$target"
         installed = runner(
             relay_ssh_command(
                 relay_host,
-                ["bash", "-s", "--", remote_key],
+                [
+                    "sh", "-c",
+                    'umask 077; cat > "$1" && chmod 0600 "$1"',
+                    "coinrun-key-install", remote_key,
+                ],
             ),
             input=key.read_text(encoding="utf-8"),
             text=True,

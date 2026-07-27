@@ -571,6 +571,32 @@ class CommandConstructionTests(unittest.TestCase):
         self.assertIn("/tmp/coinrun-relay-pod-1.key", cleanup_text)
         self.assertIn("/tmp/coinrun-relay-pod-1.known_hosts", cleanup_text)
 
+    def test_relay_key_bytes_are_cat_input_not_shell_source(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, _, _ = write_bundle(root)
+            plan = plan_for(root, manifest_path, bundle_dir)
+            key = root / "ephemeral"
+            key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n", encoding="utf-8")
+            rc.transfer_bundle_via_relay(
+                "fw-robot1", "/root/coinrun-bundles", "1.2.3.4", 40022,
+                pod_id="pod-1", key=key, plan=plan, runner=runner,
+            )
+        install_command, install_kwargs = calls[0]
+        install_text = " ".join(install_command)
+        self.assertIn("cat", install_text)
+        self.assertNotIn("BEGIN OPENSSH", install_text)
+        self.assertEqual(
+            install_kwargs["input"],
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n",
+        )
+
     def test_remote_setup_verifies_hash_size_and_procgen(self):
         script = rc.REMOTE_BUNDLE_SETUP
         self.assertIn("sha256sum", script)
