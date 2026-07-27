@@ -1566,6 +1566,45 @@ def install_remote_script(
         )
 
 
+REMOTE_EXPERIMENT_START = (
+    # RUNPOD_API_KEY lives in the pod environment, which an SSH session does
+    # not inherit; /etc/rp_environment restores it so the remote watchdog can
+    # self-terminate.
+    "set -a; . /etc/rp_environment 2>/dev/null || true; set +a; "
+    "nohup setsid bash /tmp/run_coinrun.sh "
+    "> /tmp/run_coinrun.boot.log 2>&1 < /dev/null & echo started"
+)
+
+
+def start_remote_experiment(
+    host: str,
+    port: int,
+    *,
+    key: Path,
+    known_hosts: Path,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout: float | None = None,
+) -> None:
+    result = runner(
+        ssh_command(
+            host,
+            port,
+            key=key,
+            known_hosts=known_hosts,
+            remote=["bash", "-lc", REMOTE_EXPERIMENT_START],
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise DeploymentError(
+            f"could not start the remote experiment: "
+            f"{result.stderr.strip()[:400]}"
+        )
+
+
 def append_transfer_telemetry(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -1696,27 +1735,14 @@ def perform_bundle_setup(
         timeout=120,
     )
 
-    launch = runner(
-        ssh_command(
-            host, port, key=key, known_hosts=known_hosts,
-            remote=[
-                "bash", "-lc",
-                shlex.quote(
-                    # RUNPOD_API_KEY lives in the pod environment, which an SSH
-                    # session does not inherit; /etc/rp_environment restores it
-                    # so the remote watchdog can self-terminate.
-                    "set -a; . /etc/rp_environment 2>/dev/null || true; set +a; "
-                    "nohup setsid bash /tmp/run_coinrun.sh "
-                    "> /tmp/run_coinrun.boot.log 2>&1 < /dev/null & echo started"
-                ),
-            ],
-        ),
-        text=True, capture_output=True, check=False, timeout=120,
+    start_remote_experiment(
+        host,
+        port,
+        key=key,
+        known_hosts=known_hosts,
+        runner=runner,
+        timeout=120,
     )
-    if launch.returncode != 0:
-        raise DeploymentError(
-            f"could not start the remote experiment: {launch.stderr.strip()[:400]}"
-        )
 
     if clock() > setup_deadline:
         raise DeploymentError("bundle setup exceeded its budget before the experiment began")

@@ -11,6 +11,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -666,6 +667,28 @@ class CommandConstructionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(target.read_text(encoding="utf-8"), payload)
             self.assertTrue(target.stat().st_mode & 0o100)
+
+    def test_experiment_start_is_quoted_once_by_ssh_builder(self):
+        captured = {}
+
+        def runner(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, "started\n", "")
+
+        rc.start_remote_experiment(
+            "1.2.3.4",
+            22,
+            key=Path("/k"),
+            known_hosts=Path("/kh"),
+            runner=runner,
+        )
+        remote_command = captured["command"][-1]
+        self.assertTrue(remote_command.startswith("bash -lc "))
+        self.assertIn("nohup setsid bash /tmp/run_coinrun.sh", remote_command)
+        self.assertNotIn(
+            shlex.quote(shlex.quote(rc.REMOTE_EXPERIMENT_START)),
+            remote_command,
+        )
 
     def test_bundle_shim_exports_nvidia_wheel_library_paths(self):
         script = rc.REMOTE_BUNDLE_SETUP
