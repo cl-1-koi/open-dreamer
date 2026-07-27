@@ -70,7 +70,7 @@ from dreamer.generation import DenoiseSchedule, latent_rollout  # noqa: E402
 from dreamer.parallel import build_parallel  # noqa: E402
 from dreamer.sampler import decode_jit, encode_jit  # noqa: E402
 
-SCHEMA_VERSION = "coinrun-eval/2"
+SCHEMA_VERSION = "coinrun-eval/3"
 
 # --- CoinRun action semantics (adversarial review G3, procgen/env.py) ---
 # Action table: 0 (LEFT,DOWN) 1 (LEFT) 2 (LEFT,UP) 3 (DOWN) 4 () 5 (UP)
@@ -78,9 +78,15 @@ SCHEMA_VERSION = "coinrun-eval/2"
 # CoinRun has no special actions; basic-abstract-game.cpp maps action % 9 and
 # forces 4 for action >= 9, so indices 9-14 are no-op aliases. Behaviorally
 # distinct actions are 0-8, and the no-op is index 4.
-COINRUN_NUM_ACTIONS = 15
+COINRUN_RAW_NUM_ACTIONS = 15
+# Backward-compatible name used by helpers that operate on raw Procgen records.
+COINRUN_NUM_ACTIONS = COINRUN_RAW_NUM_ACTIONS
 COINRUN_NOOP_INDEX = 4
 COINRUN_DISTINCT_ACTIONS = 9
+COINRUN_SUPPORTED_ACTION_DIMS = (
+    COINRUN_DISTINCT_ACTIONS,
+    COINRUN_RAW_NUM_ACTIONS,
+)
 # Derangement of the 9 distinct actions: x -> (x + 5) % 9. Every index maps to
 # a behaviorally different one (checked against the table above, e.g.
 # 4 (no-op) -> 0 (LEFT,DOWN), 8 (RIGHT,UP) -> 4 (no-op), 7 (RIGHT) -> 3 (DOWN)).
@@ -553,10 +559,12 @@ def preflight_dataset(
                 "first_record_raw_video_nbytes": len(record["raw_video"]),
             }
 
-    if action_min is not None and (action_min < 0 or action_max >= COINRUN_NUM_ACTIONS):
+    if action_min is not None and (
+        action_min < 0 or action_max >= COINRUN_RAW_NUM_ACTIONS
+    ):
         raise ValueError(
             f"Scanned records contain action indices [{action_min}, {action_max}], "
-            f"outside CoinRun's 15 legal actions [0, {COINRUN_NUM_ACTIONS}) "
+            f"outside CoinRun's 15 raw actions [0, {COINRUN_RAW_NUM_ACTIONS}) "
             "(review G3)."
         )
     if usable == 0:
@@ -659,16 +667,17 @@ def validate_model_configs(dyn_cfg, tok_cfg, dataset_info: dict) -> None:
 
     Fail-closed gates (adversarial review):
       - G2: latent_mean/latent_std must be set on the dynamics checkpoint.
-      - G3: the action space must be CoinRun's 15 discrete actions.
+      - G3: the action space must be either CoinRun's canonical 9 distinct
+        actions or its raw 15-action table (indices 9-14 are no-op aliases).
     """
     cat_dim = int(dyn_cfg.categorical_action_dim)
-    if cat_dim != COINRUN_NUM_ACTIONS:
+    if cat_dim not in COINRUN_SUPPORTED_ACTION_DIMS:
         raise ValueError(
             f"The dynamics checkpoint declares categorical_action_dim={cat_dim}, "
-            f"but Procgen CoinRun has exactly {COINRUN_NUM_ACTIONS} discrete "
-            "actions (review G3). A 16-wide table indicates the old, "
-            "mismatched convention (and the wrong no-op index); refusing to "
-            "evaluate against it."
+            "but CoinRun evaluation supports only the canonical 9 distinct "
+            "actions or the raw 15-action table with six no-op aliases "
+            "(review G3). A 16-wide table indicates the old mismatched "
+            "convention; refusing to evaluate against it."
         )
     if dyn_cfg.latent_mean is None or dyn_cfg.latent_std is None:
         raise ValueError(
@@ -1077,8 +1086,13 @@ def run(args: Args) -> dict:
             "action_permutation_mapping": list(ACTION_INDEX_PERMUTATION),
             "action_permutation_note": (
                 "indices 0-8 remapped by x -> (x + 5) % 9 (all behaviorally "
-                "distinct); no-op aliases 9-14 unchanged; no-op index 4 used "
-                "for the start-of-sequence shift"
+                "distinct); "
+                + (
+                    "no-op aliases 9-14 unchanged; "
+                    if categorical_action_dim == COINRUN_RAW_NUM_ACTIONS
+                    else "the canonical table has no alias indices; "
+                )
+                + "no-op index 4 used for the start-of-sequence shift"
             ),
         },
     }

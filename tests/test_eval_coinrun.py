@@ -362,6 +362,11 @@ class TestValidateModelConfigs(unittest.TestCase):
         dyn_cfg, tok_cfg, info = self._cfgs()
         ec.validate_model_configs(dyn_cfg, tok_cfg, info)
 
+    def test_canonical_action_dim_9_passes_with_matching_dataset(self):
+        dyn_cfg, tok_cfg, info = self._cfgs(categorical_action_dim=9)
+        info["action_max"] = 8
+        ec.validate_model_configs(dyn_cfg, tok_cfg, info)
+
     def test_action_dim_16_refused(self):
         dyn_cfg, tok_cfg, info = self._cfgs(categorical_action_dim=16)
         with self.assertRaisesRegex(ValueError, "15"):
