@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import pickle
 import platform
@@ -37,6 +38,9 @@ DEFAULT_STEPS = 3
 COINRUN_ACTION_DIM = 15
 COINRUN_NOOP_ACTION = 4
 MAX_CHECKPOINT_INTERVAL_SECONDS = 15 * 60
+DEFAULT_DATASET_MAX_EPISODE_LENGTH = 256
+DEFAULT_LATENT_STAT_MAX_RECORDS = 4
+DEFAULT_LATENT_STD_EPSILON = 1e-6
 MIB = 1024 * 1024
 
 
@@ -347,6 +351,57 @@ def fatal_artifact_failures(output: str) -> list[str]:
     return [description for marker, description in markers.items() if marker in output]
 
 
+def build_default_dataset_command(
+    *,
+    repo_root: Path,
+    dataset_dir: Path,
+    sequence_length: int,
+    seed: int,
+    uv_executable: str | None = None,
+) -> list[str]:
+    uv = uv_executable or shutil.which("uv")
+    if not uv:
+        raise PreflightError(
+            "Default CoinRun generation requires the uv executable for its "
+            "isolated PEP 723 environment"
+        )
+    generator = repo_root / "dreamer" / "data" / "generate_coinrun_dataset.py"
+    if not generator.is_file():
+        raise PreflightError(f"Missing CoinRun dataset generator: {generator}")
+    return [
+        uv,
+        "run",
+        "--isolated",
+        "--script",
+        str(generator),
+        "--num-episodes-train=2",
+        "--num-episodes-val=1",
+        "--num-episodes-test=1",
+        f"--output-dir={dataset_dir}",
+        f"--min-episode-length={sequence_length}",
+        f"--max-episode-length={DEFAULT_DATASET_MAX_EPISODE_LENGTH}",
+        f"--chunk-size={DEFAULT_DATASET_MAX_EPISODE_LENGTH}",
+        "--chunks-per-file=1",
+        "--collector=scripted",
+        "--keep-short-terminated",
+        f"--seed={seed}",
+        "--overwrite",
+    ]
+
+
+def default_collection_scope(sequence_length: int) -> dict[str, Any]:
+    return {
+        "arm": "scripted_plumbing",
+        "collector": "scripted",
+        "purpose": "bounded plumbing and reward-prevalence gate",
+        "max_episode_length": DEFAULT_DATASET_MAX_EPISODE_LENGTH,
+        "chunk_size": DEFAULT_DATASET_MAX_EPISODE_LENGTH,
+        "minimum_training_window": sequence_length,
+        "keep_short_terminated": True,
+        "scientific_comparison": "random-versus-scripted remains follow-on",
+    }
+
+
 def _load_trainer_module(stage: str, trainer_path: Path):
     module_name = f"_coinrun_preflight_{stage}_trainer"
     spec = importlib.util.spec_from_file_location(module_name, trainer_path)
@@ -593,6 +648,333 @@ def instrumented_trainer_main(argv: Sequence[str]) -> int:
         raise
 
 
+def validate_measured_latent_stats(
+    payload: dict[str, Any],
+    *,
+    expected_dim: int | None = None,
+    std_epsilon: float = DEFAULT_LATENT_STD_EPSILON,
+) -> dict[str, Any]:
+    mean = payload.get("latent_mean")
+    std = payload.get("latent_std")
+    if not isinstance(mean, list) or not isinstance(std, list):
+        raise PreflightError(
+            "Held-out tokenizer probe must produce list-valued latent_mean/latent_std"
+        )
+    if not mean or len(mean) != len(std):
+        raise PreflightError(
+            "Held-out tokenizer latent_mean/latent_std must have equal nonzero lengths"
+        )
+    if expected_dim is not None and len(mean) != expected_dim:
+        raise PreflightError(
+            f"Held-out tokenizer latent dimension {len(mean)} does not match "
+            f"expected d_bottleneck={expected_dim}"
+        )
+    if std_epsilon <= 0:
+        raise PreflightError("Latent standard-deviation epsilon must be positive")
+
+    nonfinite_mean = [
+        index for index, value in enumerate(mean) if not math.isfinite(float(value))
+    ]
+    nonfinite_std = [
+        index for index, value in enumerate(std) if not math.isfinite(float(value))
+    ]
+    near_zero_std = [
+        index for index, value in enumerate(std) if float(value) <= std_epsilon
+    ]
+    if nonfinite_mean or nonfinite_std or near_zero_std:
+        raise PreflightError(
+            "Held-out tokenizer latent statistics failed closed: "
+            f"nonfinite_mean_dims={nonfinite_mean}, "
+            f"nonfinite_std_dims={nonfinite_std}, "
+            f"std_at_or_below_{std_epsilon:g}={near_zero_std}"
+        )
+
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        raise PreflightError("Held-out tokenizer latent statistics lack source metadata")
+    if source.get("split") != "val":
+        raise PreflightError(
+            f"Latent statistics must come from held-out val records, got "
+            f"{source.get('split')!r}"
+        )
+    if source.get("tokenizer_variant") != "online":
+        raise PreflightError(
+            "Latent statistics must come from the restored online tokenizer"
+        )
+    checkpoint_step = source.get("checkpoint_step")
+    if not isinstance(checkpoint_step, int) or checkpoint_step < 0:
+        raise PreflightError(
+            "Latent statistics source must identify a restored checkpoint step"
+        )
+    level_seeds = source.get("level_seeds")
+    if not isinstance(level_seeds, list) or not level_seeds:
+        raise PreflightError(
+            "Latent statistics source must identify held-out val level seeds"
+        )
+    latent_sample_count = payload.get("latent_sample_count")
+    frame_count = payload.get("frame_count")
+    record_count = payload.get("record_count")
+    if not isinstance(latent_sample_count, int) or latent_sample_count <= 0:
+        raise PreflightError("Latent statistics have no bottleneck samples")
+    if not isinstance(frame_count, int) or frame_count <= 0:
+        raise PreflightError("Latent statistics have no held-out frames")
+    if not isinstance(record_count, int) or record_count <= 0:
+        raise PreflightError("Latent statistics have no held-out records")
+
+    return {
+        "passed": True,
+        "dimensions": len(mean),
+        "minimum_std": min(float(value) for value in std),
+        "maximum_std": max(float(value) for value in std),
+        "std_epsilon": std_epsilon,
+        "latent_sample_count": latent_sample_count,
+        "frame_count": frame_count,
+        "record_count": record_count,
+        "source": source,
+    }
+
+
+def build_latent_hydra_overrides(payload: dict[str, Any]) -> list[str]:
+    validate_measured_latent_stats(payload)
+    mean = json.dumps(payload["latent_mean"], separators=(",", ":"))
+    std = json.dumps(payload["latent_std"], separators=(",", ":"))
+    return [
+        f"dynamics.latent_mean={mean}",
+        f"dynamics.latent_std={std}",
+    ]
+
+
+def compute_tokenizer_probe_metrics(
+    *,
+    latents: Any,
+    reconstructions: Any,
+    targets: Any,
+    dataset_mean: Sequence[float],
+) -> dict[str, Any]:
+    import numpy as np
+
+    latent_array = np.asarray(latents, dtype=np.float64)
+    reconstruction = np.asarray(reconstructions, dtype=np.float64)
+    target = np.asarray(targets, dtype=np.float64)
+    if latent_array.ndim != 4:
+        raise PreflightError(
+            f"Tokenizer latents must have shape (B,T,N,D), got {latent_array.shape}"
+        )
+    if reconstruction.shape != target.shape or target.ndim != 5:
+        raise PreflightError(
+            "Tokenizer reconstruction and target must share shape (B,T,H,W,C); "
+            f"got {reconstruction.shape} and {target.shape}"
+        )
+
+    flattened_latents = latent_array.reshape(-1, latent_array.shape[-1])
+    latent_mean = np.mean(flattened_latents, axis=0)
+    latent_std = np.std(flattened_latents, axis=0)
+
+    target_unit = target / 255.0
+    reconstruction_unit = np.clip(reconstruction, 0.0, 255.0) / 255.0
+    channel_mean = np.asarray(dataset_mean, dtype=np.float64)
+    if channel_mean.shape != (target.shape[-1],):
+        raise PreflightError(
+            f"Dataset mean shape {channel_mean.shape} does not match "
+            f"target channels {target.shape[-1]}"
+        )
+    mean_prediction = np.broadcast_to(channel_mean, target_unit.shape)
+
+    def mse(left, right) -> float:
+        return float(np.mean(np.square(left - right), dtype=np.float64))
+
+    def psnr(mse_value: float) -> float:
+        return float(-10.0 * math.log10(max(mse_value, 1e-12)))
+
+    reconstruction_mse = mse(reconstruction_unit, target_unit)
+    dataset_mean_mse = mse(mean_prediction, target_unit)
+    if target.shape[1] > 1:
+        reconstruction_transition_mse = mse(
+            reconstruction_unit[:, 1:], target_unit[:, 1:]
+        )
+        copy_previous_mse = mse(target_unit[:, :-1], target_unit[:, 1:])
+    else:
+        reconstruction_transition_mse = None
+        copy_previous_mse = None
+
+    reconstruction_metrics = {
+        "pixel_range": "[0,1]",
+        "model_mse": reconstruction_mse,
+        "model_psnr_db": psnr(reconstruction_mse),
+        "dataset_mean_baseline_mse": dataset_mean_mse,
+        "dataset_mean_baseline_psnr_db": psnr(dataset_mean_mse),
+        "beats_dataset_mean_baseline": reconstruction_mse < dataset_mean_mse,
+        "model_to_dataset_mean_mse_ratio": (
+            reconstruction_mse / dataset_mean_mse
+            if dataset_mean_mse > 0
+            else None
+        ),
+        "model_transition_mse": reconstruction_transition_mse,
+        "copy_previous_baseline_mse": copy_previous_mse,
+        "copy_previous_baseline_psnr_db": (
+            psnr(copy_previous_mse) if copy_previous_mse is not None else None
+        ),
+        "beats_copy_previous_baseline": (
+            reconstruction_transition_mse < copy_previous_mse
+            if reconstruction_transition_mse is not None
+            and copy_previous_mse is not None
+            else None
+        ),
+        "model_to_copy_previous_mse_ratio": (
+            reconstruction_transition_mse / copy_previous_mse
+            if reconstruction_transition_mse is not None
+            and copy_previous_mse is not None
+            and copy_previous_mse > 0
+            else None
+        ),
+        "gate_mode": "diagnostic_only_for_bounded_plumbing_smoke",
+    }
+    numeric_metrics = [
+        value
+        for value in reconstruction_metrics.values()
+        if isinstance(value, float)
+    ]
+    if not all(math.isfinite(value) for value in numeric_metrics):
+        raise PreflightError(
+            "Held-out tokenizer reconstruction metrics contain nonfinite values"
+        )
+
+    return {
+        "latent_mean": latent_mean.tolist(),
+        "latent_std": latent_std.tolist(),
+        "latent_sample_count": int(flattened_latents.shape[0]),
+        "d_bottleneck": int(latent_array.shape[-1]),
+        "n_latents": int(latent_array.shape[-2]),
+        "reconstruction": reconstruction_metrics,
+    }
+
+
+def tokenizer_probe_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Internal bounded held-out tokenizer latent/reconstruction probe."
+    )
+    parser.add_argument("--checkpoint-dir", required=True)
+    parser.add_argument("--dataset-dir", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--sequence-length", required=True, type=int)
+    parser.add_argument(
+        "--max-records", type=int, default=DEFAULT_LATENT_STAT_MAX_RECORDS
+    )
+    parser.add_argument(
+        "--std-epsilon", type=float, default=DEFAULT_LATENT_STD_EPSILON
+    )
+    args = parser.parse_args(argv)
+    if args.sequence_length <= 1:
+        raise PreflightError("Tokenizer probe sequence length must be greater than 1")
+    if args.max_records <= 0:
+        raise PreflightError("Tokenizer probe max records must be positive")
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from flax import nnx
+
+    from dreamer.checkpointing import TokenizerCheckpointBundle
+    from dreamer.parallel import build_parallel
+
+    dataset_dir = Path(args.dataset_dir).resolve()
+    checkpoint_dir = Path(args.checkpoint_dir).resolve()
+    output_path = Path(args.output).resolve()
+    clips = []
+    level_seeds = []
+    skipped_short_records = 0
+    for split, raw_record in iter_array_records(dataset_dir):
+        if split != "val":
+            continue
+        record = pickle.loads(raw_record)
+        sequence_length = int(record["sequence_length"])
+        if sequence_length < args.sequence_length:
+            skipped_short_records += 1
+            continue
+        frame_shape = tuple(
+            int(value) for value in record.get("frame_shape", (64, 64, 3))
+        )
+        frames = np.frombuffer(record["raw_video"], dtype=np.uint8).reshape(
+            sequence_length, *frame_shape
+        )
+        clips.append(frames[: args.sequence_length])
+        if "level_seed" in record:
+            level_seeds.append(int(record["level_seed"]))
+        if len(clips) >= args.max_records:
+            break
+    if not clips:
+        raise PreflightError(
+            "Held-out tokenizer probe found no val record long enough for "
+            f"sequence_length={args.sequence_length}; "
+            f"skipped_short_records={skipped_short_records}"
+        )
+
+    videos_np = np.stack(clips)
+    mesh, _, mesh_rules = build_parallel("data")
+    started = time.perf_counter()
+    with jax.set_mesh(mesh):
+        bundle = TokenizerCheckpointBundle.from_pretrained(
+            str(checkpoint_dir),
+            mesh_rules=mesh_rules,
+            model_names={"tokenizer"},
+        )
+        tokenizer = bundle.tokenizer
+
+        @nnx.jit
+        def probe_step(model, videos):
+            latent_values, _, _ = model.encode(videos, deterministic=True)
+            reconstructed, _ = model.decode(latent_values, deterministic=True)
+            return latent_values, reconstructed
+
+        latents, reconstructions = probe_step(
+            tokenizer, jnp.asarray(videos_np)
+        )
+        latents, reconstructions = jax.device_get((latents, reconstructions))
+    elapsed = time.perf_counter() - started
+
+    metrics = compute_tokenizer_probe_metrics(
+        latents=latents,
+        reconstructions=reconstructions,
+        targets=videos_np,
+        dataset_mean=tuple(tokenizer.cfg.encoder.dataset_mean),
+    )
+    checkpoint_steps = [
+        int(path.name)
+        for path in checkpoint_dir.iterdir()
+        if path.is_dir() and path.name.isdigit()
+    ]
+    payload = {
+        "schema_version": 1,
+        **metrics,
+        "frame_count": int(videos_np.shape[0] * videos_np.shape[1]),
+        "record_count": len(clips),
+        "sequence_length": args.sequence_length,
+        "skipped_short_records": skipped_short_records,
+        "source": {
+            "split": "val",
+            "level_seeds": sorted(set(level_seeds)),
+            "tokenizer_variant": "online",
+            "checkpoint_dir": str(checkpoint_dir),
+            "checkpoint_step": max(checkpoint_steps) if checkpoint_steps else None,
+            "dataset_dir": str(dataset_dir),
+        },
+        "elapsed_seconds": elapsed,
+        "gpu_memory": _jax_memory_snapshot(),
+    }
+    payload["validation"] = validate_measured_latent_stats(
+        payload,
+        expected_dim=metrics["d_bottleneck"],
+        std_epsilon=args.std_epsilon,
+    )
+    _write_json(output_path, payload)
+    print(
+        f"Held-out tokenizer probe wrote {output_path}: "
+        f"{payload['frame_count']} frames, "
+        f"{payload['latent_sample_count']} latent samples"
+    )
+    return 0
+
+
 def read_events(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -805,6 +1187,8 @@ def validate_dataset_gates(
     stats: dict[str, Any],
     metadata: dict[str, Any],
     dataset_config: dict[str, Any],
+    *,
+    required_sequence_length: int | None = None,
 ) -> dict[str, Any]:
     errors = []
     metadata_action_dim = metadata.get("num_actions")
@@ -878,6 +1262,19 @@ def validate_dataset_gates(
         errors.append("dataset records contain no episode start boundary")
     if int(stats.get("episode_end_frames", 0)) == 0:
         errors.append("dataset records contain no episode end boundary")
+    minimum_record_length = stats.get("minimum_record_length")
+    minimum_by_split = stats.get("minimum_record_length_by_split", {})
+    if required_sequence_length is not None:
+        for split in ("train", "val"):
+            split_minimum = minimum_by_split.get(split)
+            if (
+                not isinstance(split_minimum, int)
+                or split_minimum < required_sequence_length
+            ):
+                errors.append(
+                    f"minimum {split} record length {split_minimum!r} is shorter "
+                    f"than training window {required_sequence_length}"
+                )
 
     if errors:
         raise PreflightError(
@@ -893,6 +1290,9 @@ def validate_dataset_gates(
         "reward_bias_probability": reward_bias,
         "reward_nonzero_frames": reward_frames,
         "reward_prevalence": stats.get("reward_prevalence"),
+        "minimum_record_length": minimum_record_length,
+        "minimum_record_length_by_split": minimum_by_split,
+        "required_sequence_length": required_sequence_length,
     }
 
 
@@ -1042,6 +1442,8 @@ def summarize_dataset_records(
     total_frames = 0
     decoded_value_min = 255
     decoded_value_max = 0
+    record_lengths: list[int] = []
+    record_lengths_by_split: dict[str, list[int]] = {}
 
     for split, raw_record in records:
         if deadline is not None and time.monotonic() >= deadline:
@@ -1089,6 +1491,8 @@ def summarize_dataset_records(
 
         total_records += 1
         total_frames += sequence_length
+        record_lengths.append(sequence_length)
+        record_lengths_by_split.setdefault(split, []).append(sequence_length)
         records_by_split[split] += 1
         frames_by_split[split] += sequence_length
         action_histogram.update(actions)
@@ -1178,6 +1582,16 @@ def summarize_dataset_records(
         "episode_end_frames": episode_end_frames,
         "decoded_pixel_min": decoded_value_min,
         "decoded_pixel_max": decoded_value_max,
+        "minimum_record_length": min(record_lengths),
+        "maximum_record_length": max(record_lengths),
+        "minimum_record_length_by_split": {
+            split: min(lengths)
+            for split, lengths in sorted(record_lengths_by_split.items())
+        },
+        "maximum_record_length_by_split": {
+            split: max(lengths)
+            for split, lengths in sorted(record_lengths_by_split.items())
+        },
     }
 
 
@@ -1420,6 +1834,7 @@ class Preflight:
         run_dir: Path,
         dataset_dir: Path,
         tokenizer_checkpoint: Path | None = None,
+        latent_stats: dict[str, Any] | None = None,
     ) -> list[str]:
         trainer_path = self.repo_root / "scripts" / f"train_{stage}.py"
         command = [
@@ -1457,6 +1872,10 @@ class Preflight:
         else:
             if tokenizer_checkpoint is None:
                 raise PreflightError("Dynamics stage requires a tokenizer checkpoint")
+            if latent_stats is None:
+                raise PreflightError(
+                    "Dynamics stage requires measured held-out tokenizer latent stats"
+                )
             command.extend(
                 [
                     f"tokenizer_ckpt={tokenizer_checkpoint}",
@@ -1468,6 +1887,7 @@ class Preflight:
                     "write_video_every=0",
                 ]
             )
+            command.extend(build_latent_hydra_overrides(latent_stats))
         return command
 
     def run(self) -> None:
@@ -1490,27 +1910,22 @@ class Preflight:
                 part.format(dataset_dir=str(dataset_dir))
                 for part in shlex.split(self.args.dataset_command)
             ]
+            collection_scope = {
+                "arm": "custom",
+                "purpose": "caller-supplied dataset command",
+                "scientific_comparison": "not inferred by preflight",
+            }
         else:
-            dataset_command = [
-                sys.executable,
-                str(
-                    self.repo_root
-                    / "dreamer"
-                    / "data"
-                    / "generate_coinrun_dataset.py"
-                ),
-                "--num-episodes-train=2",
-                "--num-episodes-val=1",
-                "--num-episodes-test=1",
-                f"--output-dir={dataset_dir}",
-                f"--min-episode-length={self.args.sequence_length}",
-                f"--max-episode-length={self.args.sequence_length}",
-                f"--chunk-size={self.args.sequence_length}",
-                "--chunks-per-file=1",
-                f"--seed={self.args.seed}",
-                "--overwrite",
-            ]
+            dataset_command = build_default_dataset_command(
+                repo_root=self.repo_root,
+                dataset_dir=dataset_dir,
+                sequence_length=self.args.sequence_length,
+                seed=self.args.seed,
+            )
             dataset_command.extend(self.args.dataset_arg)
+            collection_scope = default_collection_scope(self.args.sequence_length)
+        self.report["collection_scope"] = collection_scope
+        self._flush()
         self._stage_command("dataset_generation", dataset_command)
 
         dataset_stats = self._record_python_stage(
@@ -1542,7 +1957,10 @@ class Preflight:
         dataset_gates = self._record_python_stage(
             "dataset_gates",
             lambda: validate_dataset_gates(
-                dataset_stats, dataset_metadata, dataset_config
+                dataset_stats,
+                dataset_metadata,
+                dataset_config,
+                required_sequence_length=self.args.sequence_length,
             ),
         )
         self.report["dataset"]["gates"] = dataset_gates
@@ -1604,6 +2022,47 @@ class Preflight:
         restore_stage["checkpoint_paths"] = tokenizer_checkpoints
         self._flush()
 
+        tokenizer_probe_path = self.output_dir / "tokenizer_heldout_probe.json"
+        tokenizer_probe_command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "_tokenizer_probe",
+            f"--checkpoint-dir={tokenizer_run / 'checkpoints'}",
+            f"--dataset-dir={dataset_dir}",
+            f"--output={tokenizer_probe_path}",
+            f"--sequence-length={self.args.sequence_length}",
+            f"--max-records={self.args.latent_stat_max_records}",
+            f"--std-epsilon={self.args.latent_std_epsilon}",
+        ]
+        tokenizer_probe_stage, _ = self._stage_command(
+            "tokenizer_heldout_probe", tokenizer_probe_command
+        )
+        if not tokenizer_probe_path.is_file():
+            raise PreflightError(
+                f"Held-out tokenizer probe did not produce {tokenizer_probe_path}"
+            )
+        try:
+            tokenizer_probe = json.loads(
+                tokenizer_probe_path.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError as exc:
+            raise PreflightError(
+                f"Invalid held-out tokenizer probe artifact "
+                f"{tokenizer_probe_path}: {exc}"
+            ) from exc
+        validate_measured_latent_stats(
+            tokenizer_probe,
+            expected_dim=tokenizer_probe.get("d_bottleneck"),
+            std_epsilon=self.args.latent_std_epsilon,
+        )
+        tokenizer_probe_stage["telemetry"] = tokenizer_probe
+        self.report["tokenizer_heldout_probe"] = {
+            "path": str(tokenizer_probe_path),
+            "sha256": hashlib.sha256(tokenizer_probe_path.read_bytes()).hexdigest(),
+            **tokenizer_probe,
+        }
+        self._flush()
+
         dynamics_run = self.output_dir / "dynamics"
         dynamics_events = self.output_dir / "events" / "dynamics.jsonl"
         dynamics_command = self._trainer_command(
@@ -1613,6 +2072,7 @@ class Preflight:
             run_dir=dynamics_run,
             dataset_dir=dataset_dir,
             tokenizer_checkpoint=tokenizer_run / "checkpoints",
+            latent_stats=tokenizer_probe,
         )
         dynamics_stage, dynamics_event_data = self._stage_command(
             "dynamics_train", dynamics_command, event_path=dynamics_events
@@ -1656,6 +2116,7 @@ class Preflight:
             run_dir=dynamics_run,
             dataset_dir=dataset_dir,
             tokenizer_checkpoint=tokenizer_run / "checkpoints",
+            latent_stats=tokenizer_probe,
         )
         dynamics_restore_stage, dynamics_restore_data = self._stage_command(
             "dynamics_restore",
@@ -1731,6 +2192,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--sequence-length", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--latent-stat-max-records",
+        type=int,
+        default=DEFAULT_LATENT_STAT_MAX_RECORDS,
+    )
+    parser.add_argument(
+        "--latent-std-epsilon",
+        type=float,
+        default=DEFAULT_LATENT_STD_EPSILON,
+    )
     parser.add_argument("--tokenizer-config")
     parser.add_argument("--dynamics-config")
     parser.add_argument(
@@ -1763,6 +2234,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise PreflightError(
             "--batch-size must be positive and --sequence-length must be greater than 5"
         )
+    if args.latent_stat_max_records <= 0:
+        raise PreflightError("--latent-stat-max-records must be positive")
+    if args.latent_std_epsilon <= 0:
+        raise PreflightError("--latent-std-epsilon must be positive")
 
     preflight: Preflight | None = None
     try:
@@ -1791,4 +2266,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "_instrumented_trainer":
         raise SystemExit(instrumented_trainer_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "_tokenizer_probe":
+        raise SystemExit(tokenizer_probe_main(sys.argv[2:]))
     raise SystemExit(main())

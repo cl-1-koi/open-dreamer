@@ -5,13 +5,19 @@ import sys
 import tempfile
 import time
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
 
 from scripts.coinrun_preflight import (
     HardRuntimeExceeded,
+    Preflight,
     PreflightError,
+    build_default_dataset_command,
+    build_latent_hydra_overrides,
+    compute_tokenizer_probe_metrics,
+    default_collection_scope,
     discover_checkpoints,
     fatal_artifact_failures,
     find_coinrun_config,
@@ -21,6 +27,7 @@ from scripts.coinrun_preflight import (
     validate_checkpoint_cadence,
     validate_dataset_gates,
     validate_dynamics_preconditions,
+    validate_measured_latent_stats,
 )
 
 
@@ -107,6 +114,44 @@ class TrainingTelemetryTests(unittest.TestCase):
 
 
 class DatasetTelemetryTests(unittest.TestCase):
+    def test_default_generator_uses_isolated_pep723_scripted_arm(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        dataset_dir = Path("/tmp/coinrun-preflight-dataset")
+
+        command = build_default_dataset_command(
+            repo_root=repo_root,
+            dataset_dir=dataset_dir,
+            sequence_length=16,
+            seed=7,
+            uv_executable="/opt/uv",
+        )
+
+        self.assertEqual(
+            command[:5],
+            [
+                "/opt/uv",
+                "run",
+                "--isolated",
+                "--script",
+                str(
+                    repo_root
+                    / "dreamer"
+                    / "data"
+                    / "generate_coinrun_dataset.py"
+                ),
+            ],
+        )
+        self.assertIn("--collector=scripted", command)
+        self.assertIn("--min-episode-length=16", command)
+        self.assertIn("--max-episode-length=256", command)
+        self.assertIn("--chunk-size=256", command)
+        self.assertIn("--keep-short-terminated", command)
+        self.assertIn("--seed=7", command)
+        self.assertNotIn(sys.executable, command)
+        scope = default_collection_scope(16)
+        self.assertEqual(scope["arm"], "scripted_plumbing")
+        self.assertIn("follow-on", scope["scientific_comparison"])
+
     def test_decodes_and_counts_required_coinrun_fields(self):
         frames = np.arange(2 * 64 * 64 * 3, dtype=np.uint8).reshape(
             2, 64, 64, 3
@@ -161,6 +206,12 @@ class FailClosedGateTests(unittest.TestCase):
             "reward_prevalence": 0.01,
             "episode_start_frames": 4,
             "episode_end_frames": 4,
+            "minimum_record_length": 16,
+            "minimum_record_length_by_split": {
+                "train": 16,
+                "val": 16,
+                "test": 8,
+            },
         }
         self.metadata = {
             "num_actions": 15,
@@ -176,7 +227,10 @@ class FailClosedGateTests(unittest.TestCase):
 
     def test_dataset_gates_accept_declared_disjoint_rewarded_contract(self):
         result = validate_dataset_gates(
-            self.stats, self.metadata, self.dataset_config
+            self.stats,
+            self.metadata,
+            self.dataset_config,
+            required_sequence_length=16,
         )
 
         self.assertTrue(result["held_out_level_seeds_disjoint"])
@@ -188,10 +242,14 @@ class FailClosedGateTests(unittest.TestCase):
         self.dataset_config["categorical_noop"] = None
         self.stats["level_seeds_by_split"]["val"] = [2]
         self.stats["reward_nonzero_frames"] = 0
+        self.stats["minimum_record_length_by_split"]["val"] = 15
 
         with self.assertRaises(PreflightError) as context:
             validate_dataset_gates(
-                self.stats, self.metadata, self.dataset_config
+                self.stats,
+                self.metadata,
+                self.dataset_config,
+                required_sequence_length=16,
             )
 
         message = str(context.exception)
@@ -199,6 +257,7 @@ class FailClosedGateTests(unittest.TestCase):
         self.assertIn("categorical_noop=None", message)
         self.assertIn("level seed sets overlap", message)
         self.assertIn("nonzero-reward frames are zero", message)
+        self.assertIn("minimum val record length 15", message)
 
     def test_dynamics_requires_action_contract_and_explicit_latent_stats(self):
         good = {
@@ -251,6 +310,116 @@ class FailClosedGateTests(unittest.TestCase):
         summary["resolved_config"]["ckpt"]["save_interval_steps"] = 10
         with self.assertRaisesRegex(PreflightError, "at least two checkpoints"):
             validate_checkpoint_cadence(summary, ["2"])
+
+    def test_latent_stats_validate_and_build_exact_hydra_lists(self):
+        payload = {
+            "latent_mean": [0.125, -0.25],
+            "latent_std": [0.5, 0.75],
+            "latent_sample_count": 64,
+            "frame_count": 16,
+            "record_count": 1,
+            "source": {
+                "split": "val",
+                "tokenizer_variant": "online",
+                "checkpoint_step": 2,
+                "level_seeds": [123],
+            },
+        }
+
+        validation = validate_measured_latent_stats(
+            payload, expected_dim=2, std_epsilon=1e-6
+        )
+        self.assertTrue(validation["passed"])
+        self.assertEqual(
+            build_latent_hydra_overrides(payload),
+            [
+                "dynamics.latent_mean=[0.125,-0.25]",
+                "dynamics.latent_std=[0.5,0.75]",
+            ],
+        )
+
+    def test_latent_stats_fail_on_nonfinite_or_near_zero_std(self):
+        payload = {
+            "latent_mean": [0.0, float("nan")],
+            "latent_std": [1e-8, 1.0],
+            "latent_sample_count": 2,
+            "frame_count": 1,
+            "record_count": 1,
+            "source": {
+                "split": "val",
+                "tokenizer_variant": "online",
+                "checkpoint_step": 2,
+                "level_seeds": [123],
+            },
+        }
+        with self.assertRaises(PreflightError) as context:
+            validate_measured_latent_stats(
+                payload, expected_dim=2, std_epsilon=1e-6
+            )
+        self.assertIn("nonfinite_mean_dims=[1]", str(context.exception))
+        self.assertIn("std_at_or_below_1e-06=[0]", str(context.exception))
+
+    def test_tokenizer_probe_metrics_include_reconstruction_baselines(self):
+        targets = np.asarray(
+            [
+                [
+                    [[[0, 0, 0], [0, 0, 0]]],
+                    [[[255, 255, 255], [255, 255, 255]]],
+                ]
+            ],
+            dtype=np.uint8,
+        )
+        latents = np.asarray(
+            [[[[0.0, -1.0]], [[1.0, 1.0]]]], dtype=np.float32
+        )
+
+        metrics = compute_tokenizer_probe_metrics(
+            latents=latents,
+            reconstructions=targets,
+            targets=targets,
+            dataset_mean=[0.5, 0.5, 0.5],
+        )
+
+        self.assertEqual(metrics["latent_sample_count"], 2)
+        self.assertEqual(metrics["d_bottleneck"], 2)
+        self.assertEqual(metrics["reconstruction"]["model_mse"], 0.0)
+        self.assertTrue(
+            metrics["reconstruction"]["beats_dataset_mean_baseline"]
+        )
+        self.assertTrue(
+            metrics["reconstruction"]["beats_copy_previous_baseline"]
+        )
+
+    def test_dynamics_command_injects_measured_latent_stats(self):
+        preflight = object.__new__(Preflight)
+        preflight.repo_root = Path(__file__).resolve().parents[1]
+        preflight.args = Namespace(batch_size=2, sequence_length=16, steps=3)
+        payload = {
+            "latent_mean": [0.125, -0.25],
+            "latent_std": [0.5, 0.75],
+            "latent_sample_count": 64,
+            "frame_count": 16,
+            "record_count": 1,
+            "source": {
+                "split": "val",
+                "tokenizer_variant": "online",
+                "checkpoint_step": 2,
+                "level_seeds": [123],
+            },
+        }
+
+        command = preflight._trainer_command(
+            stage="dynamics",
+            config_name="coinrun_dynamics",
+            event_path=Path("/tmp/dynamics-events.jsonl"),
+            run_dir=Path("/tmp/dynamics-run"),
+            dataset_dir=Path("/tmp/dataset"),
+            tokenizer_checkpoint=Path("/tmp/tokenizer/checkpoints"),
+            latent_stats=payload,
+        )
+
+        self.assertIn("dynamics.latent_mean=[0.125,-0.25]", command)
+        self.assertIn("dynamics.latent_std=[0.5,0.75]", command)
 
 
 class BoundAndArtifactTests(unittest.TestCase):
