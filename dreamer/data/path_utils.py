@@ -1,7 +1,6 @@
 """Path utilities for ArrayRecord dataset discovery and generation."""
 
 import os
-from pathlib import Path
 from typing import Literal
 
 
@@ -20,7 +19,7 @@ def discover_array_record_paths(path: str | list[str]) -> list[str]:
     if os.path.isdir(path):
         return [
             os.path.join(path, f)
-            for f in os.listdir(path)
+            for f in sorted(os.listdir(path))
             if f.endswith(".array_record")
         ]
     else:
