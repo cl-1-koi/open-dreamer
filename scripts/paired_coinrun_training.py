@@ -33,10 +33,18 @@ from dreamer.data.paired_rgb_adapter import (
     SOURCE_SHARDS,
     sha256_file,
 )
+from scripts.coinrun_preflight import (
+    DEFAULT_LATENT_STAT_MAX_RECORDS,
+    DEFAULT_LATENT_STD_EPSILON,
+    PreflightError,
+    build_latent_hydra_overrides,
+    validate_measured_latent_stats,
+)
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_CONTRACT_FILENAME = "paired_run_contract.json"
 MANIFEST_COPY_FILENAME = "paired_manifest.json"
+LATENT_STATS_FILENAME = "tokenizer_heldout_probe.json"
 
 
 class PairedTrainingError(RuntimeError):
@@ -62,9 +70,25 @@ class TrainingPlan:
     tokenizer_config_name: str
     dynamics_config_name: str
     tokenizer_command: tuple[str, ...]
-    dynamics_command: tuple[str, ...]
+    tokenizer_probe_command: tuple[str, ...]
     tokenizer_config: dict[str, Any]
-    dynamics_config: dict[str, Any]
+    dynamics_preflight_config: dict[str, Any]
+    dynamics_user_overrides: tuple[str, ...]
+    dynamics_required_overrides: tuple[str, ...]
+    python_executable: str
+    latent_stat_max_records: int
+    latent_std_epsilon: float
+    latent_dimension: int
+
+
+@dataclass(frozen=True)
+class RuntimeDynamics:
+    command: tuple[str, ...]
+    config: dict[str, Any]
+    stats_path: Path
+    stats_sha256: str
+    stats: dict[str, Any]
+    validation: dict[str, Any]
 
 
 def _utc_now() -> str:
@@ -415,6 +439,8 @@ PROTECTED_OVERRIDES = {
     "dataset.num_binary_actions",
     "dynamics.categorical_action_dim",
     "dynamics.continuous_action_dim",
+    "dynamics.latent_mean",
+    "dynamics.latent_std",
     "dynamics.num_binary_actions",
     "hydra.run.dir",
     "run_name",
@@ -521,6 +547,7 @@ def _validate_resolved_config(
     config: Mapping[str, Any],
     corpus: ValidatedCorpus,
     tokenizer_checkpoint: Path,
+    latent_stats: Mapping[str, Any] | None = None,
 ) -> None:
     dataset = _require_mapping(
         config.get("dataset"),
@@ -575,6 +602,24 @@ def _validate_resolved_config(
                 "Resolved dynamics config does not use this paired run's "
                 "tokenizer checkpoint."
             )
+        latent_mean = dynamics.get("latent_mean")
+        latent_std = dynamics.get("latent_std")
+        if latent_stats is None:
+            if dataset.get("data_type") == "video" and (
+                latent_mean is not None or latent_std is not None
+            ):
+                raise PairedTrainingError(
+                    "Paired video dynamics preflight may not use default latent "
+                    "statistics; held-out tokenizer measurements are required."
+                )
+        else:
+            expected_mean = latent_stats["latent_mean"]
+            expected_std = latent_stats["latent_std"]
+            if latent_mean != expected_mean or latent_std != expected_std:
+                raise PairedTrainingError(
+                    "Runtime dynamics latent normalization does not exactly "
+                    "match the validated held-out tokenizer statistics."
+                )
 
 
 def build_training_plan(
@@ -590,6 +635,8 @@ def build_training_plan(
     tokenizer_overrides: Sequence[str] = (),
     dynamics_overrides: Sequence[str] = (),
     python_executable: Path | str = sys.executable,
+    latent_stat_max_records: int = DEFAULT_LATENT_STAT_MAX_RECORDS,
+    latent_std_epsilon: float = DEFAULT_LATENT_STD_EPSILON,
 ) -> TrainingPlan:
     repo_root = Path(repo_root).expanduser().resolve()
     run_dir = Path(run_dir).expanduser().resolve()
@@ -597,6 +644,10 @@ def build_training_plan(
         raise PairedTrainingError(f"Invalid repository root: {repo_root}.")
     if run_dir.exists():
         raise PairedTrainingError(f"Paired run directory already exists: {run_dir}.")
+    if latent_stat_max_records <= 0:
+        raise PairedTrainingError("latent_stat_max_records must be positive.")
+    if latent_std_epsilon <= 0:
+        raise PairedTrainingError("latent_std_epsilon must be positive.")
     _validate_user_overrides("tokenizer", tokenizer_overrides)
     _validate_user_overrides("dynamics", dynamics_overrides)
     corpus = validate_paired_corpus(
@@ -641,6 +692,29 @@ def build_training_plan(
         corpus=corpus,
         tokenizer_checkpoint=tokenizer_checkpoint,
     )
+    tokenizer_model = _require_mapping(
+        tokenizer_config.get("tokenizer"),
+        "Resolved tokenizer model config",
+    )
+    tokenizer_encoder = _require_mapping(
+        tokenizer_model.get("encoder"),
+        "Resolved tokenizer encoder config",
+    )
+    tokenizer_dimension = tokenizer_encoder.get("d_bottleneck")
+    dynamics_model = _require_mapping(
+        dynamics_config.get("dynamics"),
+        "Resolved dynamics model config",
+    )
+    dynamics_dimension = dynamics_model.get("d_bottleneck")
+    if (
+        type(tokenizer_dimension) is not int
+        or tokenizer_dimension <= 0
+        or dynamics_dimension != tokenizer_dimension
+    ):
+        raise PairedTrainingError(
+            "Tokenizer and dynamics d_bottleneck dimensions must match before "
+            "held-out latent statistics can be measured."
+        )
     _validate_resolved_config(
         stage="dynamics",
         config=dynamics_config,
@@ -656,12 +730,22 @@ def build_training_plan(
         *tokenizer_overrides,
         *tokenizer_required,
     )
-    dynamics_command = (
+    tokenizer_sequence_length = tokenizer_config["dataset"]["dataloader_cfg"]["long_T"]
+    if type(tokenizer_sequence_length) is not int or tokenizer_sequence_length <= 1:
+        raise PairedTrainingError(
+            "Tokenizer sequence length must be greater than one for the "
+            "held-out latent-stat probe."
+        )
+    tokenizer_probe_command = (
         python_executable,
-        str(repo_root / "scripts" / "train_dynamics.py"),
-        f"--config-name={dynamics_config_name}",
-        *dynamics_overrides,
-        *dynamics_required,
+        str(repo_root / "scripts" / "coinrun_preflight.py"),
+        "_tokenizer_probe",
+        f"--checkpoint-dir={tokenizer_checkpoint}",
+        f"--dataset-dir={corpus.manifest_path.parent}",
+        f"--output={run_dir / LATENT_STATS_FILENAME}",
+        f"--sequence-length={tokenizer_sequence_length}",
+        f"--max-records={latent_stat_max_records}",
+        f"--std-epsilon={latent_std_epsilon}",
     )
     return TrainingPlan(
         repo_root=repo_root,
@@ -670,9 +754,181 @@ def build_training_plan(
         tokenizer_config_name=tokenizer_config_name,
         dynamics_config_name=dynamics_config_name,
         tokenizer_command=tokenizer_command,
-        dynamics_command=dynamics_command,
+        tokenizer_probe_command=tokenizer_probe_command,
         tokenizer_config=tokenizer_config,
-        dynamics_config=dynamics_config,
+        dynamics_preflight_config=dynamics_config,
+        dynamics_user_overrides=tuple(dynamics_overrides),
+        dynamics_required_overrides=tuple(dynamics_required),
+        python_executable=python_executable,
+        latent_stat_max_records=latent_stat_max_records,
+        latent_std_epsilon=latent_std_epsilon,
+        latent_dimension=tokenizer_dimension,
+    )
+
+
+def _validation_level_ids(corpus: ValidatedCorpus) -> set[int]:
+    level_ids: set[int] = set()
+    sources = corpus.manifest["sources"]
+    for source in sources:
+        if source["split"] != "val":
+            continue
+        for episode in source["episodes"]:
+            level_id = episode.get("level_id")
+            if type(level_id) is not int:
+                raise PairedTrainingError(
+                    "Paired manifest val episodes must identify integer level IDs."
+                )
+            level_ids.add(level_id)
+    if not level_ids:
+        raise PairedTrainingError("Paired manifest contains no validation level IDs.")
+    return level_ids
+
+
+def _validate_latent_stats_artifact(
+    plan: TrainingPlan,
+    stats_path: Path | str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    stats_path = Path(stats_path).expanduser().resolve()
+    expected_path = (plan.run_dir / LATENT_STATS_FILENAME).resolve()
+    if stats_path != expected_path:
+        raise PairedTrainingError(
+            f"Latent statistics must be written to {expected_path}; got {stats_path}."
+        )
+    if not stats_path.is_file() or stats_path.stat().st_size == 0:
+        raise PairedTrainingError(
+            f"Held-out tokenizer latent-stat artifact is missing: {stats_path}."
+        )
+    try:
+        value = json.loads(stats_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PairedTrainingError(
+            f"Held-out tokenizer latent-stat artifact is malformed: {stats_path}."
+        ) from exc
+    if not isinstance(value, dict):
+        raise PairedTrainingError(
+            "Held-out tokenizer latent-stat artifact must be a JSON object."
+        )
+    try:
+        validation = validate_measured_latent_stats(
+            value,
+            expected_dim=plan.latent_dimension,
+            std_epsilon=plan.latent_std_epsilon,
+        )
+    except (PreflightError, TypeError, ValueError, OverflowError) as exc:
+        raise PairedTrainingError(
+            f"Held-out tokenizer latent statistics are invalid: {exc}"
+        ) from exc
+
+    if value.get("d_bottleneck") != plan.latent_dimension:
+        raise PairedTrainingError(
+            "Latent-stat artifact d_bottleneck does not match the selected "
+            "tokenizer/dynamics profile."
+        )
+    source = _require_mapping(
+        value.get("source"),
+        "Latent-stat source",
+    )
+    expected_dataset_dir = plan.corpus.manifest_path.parent.resolve()
+    if Path(str(source.get("dataset_dir"))).resolve() != expected_dataset_dir:
+        raise PairedTrainingError(
+            "Latent statistics were not measured from this paired corpus."
+        )
+    expected_checkpoint_dir = (plan.run_dir / "tokenizer" / "checkpoints").resolve()
+    if Path(str(source.get("checkpoint_dir"))).resolve() != expected_checkpoint_dir:
+        raise PairedTrainingError(
+            "Latent statistics were not measured from this run's tokenizer checkpoint."
+        )
+    checkpoint_step = source.get("checkpoint_step")
+    if not (expected_checkpoint_dir / str(checkpoint_step)).is_dir():
+        raise PairedTrainingError(
+            "Latent-stat source checkpoint_step does not exist in this run's "
+            "tokenizer checkpoint directory."
+        )
+
+    expected_collectors = {
+        source_summary["source"]
+        for source_summary in plan.corpus.split_summaries["val"]["sources"]
+    }
+    for field in ("collector_records_seen", "collector_records_selected"):
+        counts = source.get(field)
+        if not isinstance(counts, dict):
+            raise PairedTrainingError(f"Latent-stat source is missing {field}.")
+        missing = [
+            collector
+            for collector in sorted(expected_collectors)
+            if type(counts.get(collector)) is not int or counts[collector] <= 0
+        ]
+        if missing:
+            raise PairedTrainingError(
+                f"Latent-stat {field} lacks paired validation sources: {missing}."
+            )
+
+    measured_levels = source.get("level_seeds")
+    if (
+        not isinstance(measured_levels, list)
+        or not measured_levels
+        or any(type(level_id) is not int for level_id in measured_levels)
+    ):
+        raise PairedTrainingError(
+            "Latent-stat source must contain integer validation level IDs."
+        )
+    unknown_levels = set(measured_levels) - _validation_level_ids(plan.corpus)
+    if unknown_levels:
+        raise PairedTrainingError(
+            "Latent statistics include levels outside the paired validation "
+            f"split: {sorted(unknown_levels)}."
+        )
+    return value, validation, sha256_file(stats_path)
+
+
+def materialize_runtime_dynamics(
+    plan: TrainingPlan,
+    stats_path: Path | str,
+) -> RuntimeDynamics:
+    stats, validation, stats_sha256 = _validate_latent_stats_artifact(
+        plan,
+        stats_path,
+    )
+    try:
+        stats_overrides = build_latent_hydra_overrides(stats)
+    except (PreflightError, TypeError, ValueError, OverflowError) as exc:
+        raise PairedTrainingError(
+            f"Could not build latent normalization overrides: {exc}"
+        ) from exc
+    compose_overrides = [
+        *plan.dynamics_user_overrides,
+        *plan.dynamics_required_overrides[:-1],
+        *stats_overrides,
+    ]
+    config = _compose_config(
+        plan.repo_root,
+        plan.dynamics_config_name,
+        compose_overrides,
+    )
+    tokenizer_checkpoint = plan.run_dir / "tokenizer" / "checkpoints"
+    _validate_resolved_config(
+        stage="dynamics",
+        config=config,
+        corpus=plan.corpus,
+        tokenizer_checkpoint=tokenizer_checkpoint,
+        latent_stats=stats,
+    )
+    command = (
+        plan.python_executable,
+        str(plan.repo_root / "scripts" / "train_dynamics.py"),
+        f"--config-name={plan.dynamics_config_name}",
+        *plan.dynamics_user_overrides,
+        *plan.dynamics_required_overrides[:-1],
+        *stats_overrides,
+        plan.dynamics_required_overrides[-1],
+    )
+    return RuntimeDynamics(
+        command=command,
+        config=config,
+        stats_path=Path(stats_path).resolve(),
+        stats_sha256=stats_sha256,
+        stats=stats,
+        validation=validation,
     )
 
 
@@ -695,6 +951,8 @@ def _config_summary(
         dynamics = _require_mapping(config["dynamics"], "dynamics config")
         summary["model_categorical_action_dim"] = dynamics["categorical_action_dim"]
         summary["tokenizer_ckpt"] = config["tokenizer_ckpt"]
+        summary["latent_mean"] = dynamics["latent_mean"]
+        summary["latent_std"] = dynamics["latent_std"]
     return summary
 
 
@@ -714,31 +972,56 @@ def publish_preflight_artifacts(plan: TrainingPlan) -> Path:
         )
     inputs_dir = plan.run_dir / "inputs"
     commands_dir = plan.run_dir / "commands"
+    configs_dir = plan.run_dir / "configs"
     inputs_dir.mkdir(parents=True)
     commands_dir.mkdir()
+    configs_dir.mkdir()
     manifest_copy = inputs_dir / MANIFEST_COPY_FILENAME
     shutil.copyfile(plan.corpus.manifest_path, manifest_copy)
     if sha256_file(manifest_copy) != plan.corpus.manifest_sha256:
         raise PairedTrainingError("Copied paired manifest hash changed.")
 
+    command_artifacts = {}
     for stage, command in (
         ("tokenizer", plan.tokenizer_command),
-        ("dynamics", plan.dynamics_command),
+        ("latent_stats", plan.tokenizer_probe_command),
     ):
-        (commands_dir / f"{stage}.command").write_text(
+        command_path = commands_dir / f"{stage}.command"
+        command_path.write_text(
             shlex.join(command) + "\n",
             encoding="utf-8",
         )
+        command_artifacts[stage] = {
+            "path": str(command_path),
+            "sha256": sha256_file(command_path),
+        }
+
+    config_artifacts = {}
+    for name, config in (
+        ("tokenizer_preflight", plan.tokenizer_config),
+        ("dynamics_preflight", plan.dynamics_preflight_config),
+    ):
+        config_path = configs_dir / f"{name}.json"
+        _write_json_atomic(config_path, config)
+        config_artifacts[name] = {
+            "path": str(config_path),
+            "sha256": sha256_file(config_path),
+        }
 
     contract = {
         "action_space": plan.corpus.action_space,
+        "artifacts": {
+            "commands": command_artifacts,
+            "configs": config_artifacts,
+        },
         "commands": {
-            "dynamics": list(plan.dynamics_command),
+            "dynamics": None,
+            "latent_stats": list(plan.tokenizer_probe_command),
             "tokenizer": list(plan.tokenizer_command),
         },
         "configs": {
-            "dynamics": _config_summary(
-                plan.dynamics_config,
+            "dynamics_preflight": _config_summary(
+                plan.dynamics_preflight_config,
                 "dynamics",
                 plan.dynamics_config_name,
             ),
@@ -767,6 +1050,19 @@ def publish_preflight_artifacts(plan: TrainingPlan) -> Path:
                 "manifest_split": "val",
             },
         },
+        "stages": {
+            "dynamics": {
+                "reason": "waiting for validated held-out latent statistics",
+                "status": "blocked",
+            },
+            "latent_stats": {
+                "artifact_path": str(plan.run_dir / LATENT_STATS_FILENAME),
+                "max_records": plan.latent_stat_max_records,
+                "status": "pending",
+                "std_epsilon": plan.latent_std_epsilon,
+            },
+            "tokenizer": {"status": "pending"},
+        },
         "status": "preflight_passed",
     }
     contract_path = plan.run_dir / RUN_CONTRACT_FILENAME
@@ -785,6 +1081,69 @@ def _set_run_status(
     _write_json_atomic(contract_path, contract)
 
 
+def _set_stage_status(
+    contract_path: Path,
+    stage: str,
+    status: str,
+    **details: Any,
+) -> None:
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    stage_payload = contract["stages"][stage]
+    stage_payload["status"] = status
+    stage_payload.update(details)
+    contract["active_stage"] = None if status == "passed" else stage
+    _write_json_atomic(contract_path, contract)
+
+
+def _record_runtime_dynamics(
+    plan: TrainingPlan,
+    runtime: RuntimeDynamics,
+    contract_path: Path,
+) -> None:
+    config_path = plan.run_dir / "configs" / "dynamics_runtime.json"
+    command_path = plan.run_dir / "commands" / "dynamics.command"
+    _write_json_atomic(config_path, runtime.config)
+    command_path.write_text(
+        shlex.join(runtime.command) + "\n",
+        encoding="utf-8",
+    )
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["commands"]["dynamics"] = list(runtime.command)
+    contract["configs"]["dynamics_runtime"] = _config_summary(
+        runtime.config,
+        "dynamics",
+        plan.dynamics_config_name,
+    )
+    contract["latent_stats"] = {
+        "path": str(runtime.stats_path),
+        "sha256": runtime.stats_sha256,
+        "source": runtime.stats["source"],
+        "validation": runtime.validation,
+    }
+    contract["artifacts"]["commands"]["dynamics"] = {
+        "path": str(command_path),
+        "sha256": sha256_file(command_path),
+    }
+    contract["artifacts"]["configs"]["dynamics_runtime"] = {
+        "path": str(config_path),
+        "sha256": sha256_file(config_path),
+    }
+    contract["stages"]["latent_stats"].update(
+        {
+            "sha256": runtime.stats_sha256,
+            "status": "passed",
+            "validation": runtime.validation,
+        }
+    )
+    contract["stages"]["dynamics"] = {
+        "reason": None,
+        "status": "ready",
+    }
+    contract["status"] = "latent_stats_passed"
+    contract["active_stage"] = None
+    _write_json_atomic(contract_path, contract)
+
+
 def _revalidate_plan_corpus(plan: TrainingPlan) -> None:
     validate_paired_corpus(
         manifest_path=plan.corpus.manifest_path,
@@ -792,6 +1151,59 @@ def _revalidate_plan_corpus(plan: TrainingPlan) -> None:
         train_dir=plan.corpus.train_dir,
         validation_dir=plan.corpus.validation_dir,
     )
+
+
+def _run_stage_command(
+    plan: TrainingPlan,
+    contract_path: Path,
+    stage: str,
+    command: Sequence[str],
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+) -> Path:
+    try:
+        _revalidate_plan_corpus(plan)
+        _set_run_status(
+            contract_path,
+            f"running_{stage}",
+            active_stage=stage,
+            launch_started_at=_utc_now(),
+        )
+        _set_stage_status(
+            contract_path,
+            stage,
+            "running",
+            started_at=_utc_now(),
+        )
+        log_path = plan.run_dir / f"{stage}.log"
+        with log_path.open("wb") as log:
+            completed = runner(
+                list(command),
+                cwd=plan.repo_root,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if completed.returncode != 0:
+            raise PairedTrainingError(
+                f"{stage} stage exited with {completed.returncode}; see {log_path}."
+            )
+        return log_path
+    except BaseException as exc:
+        _set_stage_status(
+            contract_path,
+            stage,
+            "failed",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at=_utc_now(),
+        )
+        _set_run_status(
+            contract_path,
+            "failed",
+            active_stage=stage,
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at=_utc_now(),
+        )
+        raise
 
 
 def execute_training(
@@ -804,61 +1216,123 @@ def execute_training(
         raise PairedTrainingError(
             "Paired preflight artifacts must be published before launch."
         )
-    for stage, command in (
-        ("tokenizer", plan.tokenizer_command),
-        ("dynamics", plan.dynamics_command),
-    ):
-        try:
-            _revalidate_plan_corpus(plan)
-            _set_run_status(
-                contract_path,
-                f"running_{stage}",
-                active_stage=stage,
-                launch_started_at=_utc_now(),
-            )
-            log_path = plan.run_dir / f"{stage}.log"
-            with log_path.open("wb") as log:
-                completed = runner(
-                    list(command),
-                    cwd=plan.repo_root,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    check=False,
-                )
-        except BaseException as exc:
-            _set_run_status(
-                contract_path,
-                "failed",
-                active_stage=stage,
-                error=f"{type(exc).__name__}: {exc}",
-                finished_at=_utc_now(),
-            )
-            raise
-        if completed.returncode != 0:
-            _set_run_status(
-                contract_path,
-                "failed",
-                active_stage=stage,
-                error=f"{stage} trainer exited with {completed.returncode}",
-                finished_at=_utc_now(),
-            )
+
+    tokenizer_log = _run_stage_command(
+        plan,
+        contract_path,
+        "tokenizer",
+        plan.tokenizer_command,
+        runner,
+    )
+    checkpoint_dir = plan.run_dir / "tokenizer" / "checkpoints"
+    if not checkpoint_dir.is_dir() or not any(checkpoint_dir.iterdir()):
+        error = "tokenizer trainer produced no checkpoint"
+        _set_stage_status(
+            contract_path,
+            "tokenizer",
+            "failed",
+            error=error,
+            finished_at=_utc_now(),
+        )
+        _set_run_status(
+            contract_path,
+            "failed",
+            active_stage="tokenizer",
+            error=error,
+            finished_at=_utc_now(),
+        )
+        raise PairedTrainingError(
+            "Tokenizer trainer succeeded but produced no checkpoint; "
+            "latent-stat and dynamics launch are blocked."
+        )
+    _set_stage_status(
+        contract_path,
+        "tokenizer",
+        "passed",
+        checkpoint_dir=str(checkpoint_dir),
+        finished_at=_utc_now(),
+        log_path=str(tokenizer_log),
+        log_sha256=sha256_file(tokenizer_log),
+    )
+
+    stats_log = _run_stage_command(
+        plan,
+        contract_path,
+        "latent_stats",
+        plan.tokenizer_probe_command,
+        runner,
+    )
+    try:
+        runtime = materialize_runtime_dynamics(
+            plan,
+            plan.run_dir / LATENT_STATS_FILENAME,
+        )
+        _record_runtime_dynamics(plan, runtime, contract_path)
+        _set_stage_status(
+            contract_path,
+            "latent_stats",
+            "passed",
+            finished_at=_utc_now(),
+            log_path=str(stats_log),
+            log_sha256=sha256_file(stats_log),
+            sha256=runtime.stats_sha256,
+            validation=runtime.validation,
+        )
+    except BaseException as exc:
+        _set_stage_status(
+            contract_path,
+            "latent_stats",
+            "failed",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at=_utc_now(),
+        )
+        _set_run_status(
+            contract_path,
+            "failed",
+            active_stage="latent_stats",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at=_utc_now(),
+        )
+        raise
+
+    try:
+        if sha256_file(runtime.stats_path) != runtime.stats_sha256:
             raise PairedTrainingError(
-                f"{stage} trainer exited with {completed.returncode}; see {log_path}."
+                "Held-out latent-stat artifact changed before dynamics launch."
             )
-        if stage == "tokenizer":
-            checkpoint_dir = plan.run_dir / "tokenizer" / "checkpoints"
-            if not checkpoint_dir.is_dir() or not any(checkpoint_dir.iterdir()):
-                _set_run_status(
-                    contract_path,
-                    "failed",
-                    active_stage=stage,
-                    error="tokenizer trainer produced no checkpoint",
-                    finished_at=_utc_now(),
-                )
-                raise PairedTrainingError(
-                    "Tokenizer trainer succeeded but produced no checkpoint; "
-                    "dynamics launch is blocked."
-                )
+        runtime = materialize_runtime_dynamics(plan, runtime.stats_path)
+    except BaseException as exc:
+        _set_stage_status(
+            contract_path,
+            "dynamics",
+            "failed",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at=_utc_now(),
+        )
+        _set_run_status(
+            contract_path,
+            "failed",
+            active_stage="dynamics",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at=_utc_now(),
+        )
+        raise
+
+    dynamics_log = _run_stage_command(
+        plan,
+        contract_path,
+        "dynamics",
+        runtime.command,
+        runner,
+    )
+    _set_stage_status(
+        contract_path,
+        "dynamics",
+        "passed",
+        finished_at=_utc_now(),
+        log_path=str(dynamics_log),
+        log_sha256=sha256_file(dynamics_log),
+    )
     _set_run_status(
         contract_path,
         "completed",
@@ -907,6 +1381,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
     )
+    parser.add_argument(
+        "--latent-stat-max-records",
+        type=int,
+        default=DEFAULT_LATENT_STAT_MAX_RECORDS,
+    )
+    parser.add_argument(
+        "--latent-std-epsilon",
+        type=float,
+        default=DEFAULT_LATENT_STD_EPSILON,
+    )
     return parser
 
 
@@ -924,6 +1408,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             dynamics_config_name=args.dynamics_config_name,
             tokenizer_overrides=args.tokenizer_override,
             dynamics_overrides=args.dynamics_override,
+            latent_stat_max_records=args.latent_stat_max_records,
+            latent_std_epsilon=args.latent_std_epsilon,
         )
         contract_path = publish_preflight_artifacts(plan)
         if args.mode == "launch":

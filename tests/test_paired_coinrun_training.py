@@ -13,6 +13,7 @@ from dreamer.data.paired_rgb_adapter import (
     sha256_file,
 )
 from scripts.paired_coinrun_training import (
+    LATENT_STATS_FILENAME,
     MANIFEST_COPY_FILENAME,
     RUN_CONTRACT_FILENAME,
     PairedTrainingError,
@@ -39,6 +40,7 @@ def _write_manifest(root: Path, *, action_dim: int = 9) -> tuple[Path, str]:
         episode = {
             "episode_id": f"{spec.filename}-episode",
             "length": index + 1,
+            "level_id": 10_000 + index,
         }
         source = {
             "episodes": [episode],
@@ -111,6 +113,39 @@ class PairedCoinRunTrainingTest(unittest.TestCase):
         arguments.update(overrides)
         return build_training_plan(**arguments)
 
+    def _write_valid_stats(self, plan) -> Path:
+        stats_path = plan.run_dir / LATENT_STATS_FILENAME
+        dimension = plan.latent_dimension
+        stats = {
+            "d_bottleneck": dimension,
+            "frame_count": 32,
+            "latent_mean": [0.125] * dimension,
+            "latent_sample_count": 256,
+            "latent_std": [0.75] * dimension,
+            "record_count": 2,
+            "source": {
+                "checkpoint_dir": str(plan.run_dir / "tokenizer" / "checkpoints"),
+                "checkpoint_step": 1,
+                "collector_records_seen": {
+                    "random": 1,
+                    "scripted_forward_v0": 1,
+                },
+                "collector_records_selected": {
+                    "random": 1,
+                    "scripted_forward_v0": 1,
+                },
+                "dataset_dir": str(self.corpus_root),
+                "level_seeds": [10_002, 10_003],
+                "split": "val",
+                "tokenizer_variant": "online",
+            },
+        }
+        stats_path.write_text(
+            json.dumps(stats, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return stats_path
+
     def test_plan_sets_manifest_action_contract_on_both_trainers(self):
         plan = self._plan()
 
@@ -119,32 +154,28 @@ class PairedCoinRunTrainingTest(unittest.TestCase):
             9,
         )
         self.assertEqual(
-            plan.dynamics_config["dataset"]["categorical_action_dim"],
+            plan.dynamics_preflight_config["dataset"]["categorical_action_dim"],
             9,
         )
         self.assertEqual(
-            plan.dynamics_config["dynamics"]["categorical_action_dim"],
+            plan.dynamics_preflight_config["dynamics"]["categorical_action_dim"],
             9,
         )
         self.assertEqual(
-            plan.dynamics_config["dataset"]["categorical_noop"],
+            plan.dynamics_preflight_config["dataset"]["categorical_noop"],
             4,
         )
         self.assertIn(
             "dataset.categorical_action_dim=9",
             plan.tokenizer_command,
         )
-        self.assertIn(
-            "dynamics.categorical_action_dim=9",
-            plan.dynamics_command,
-        )
+        self.assertIn("_tokenizer_probe", plan.tokenizer_probe_command)
+        self.assertIsNone(plan.dynamics_preflight_config["dynamics"]["latent_mean"])
+        self.assertIsNone(plan.dynamics_preflight_config["dynamics"]["latent_std"])
         self.assertFalse(
             any(
                 "categorical_action_dim=15" in argument
-                for command in (
-                    plan.tokenizer_command,
-                    plan.dynamics_command,
-                )
+                for command in (plan.tokenizer_command,)
                 for argument in command
             )
         )
@@ -177,6 +208,13 @@ class PairedCoinRunTrainingTest(unittest.TestCase):
             contract["action_space"]["categorical_action_dim"],
             9,
         )
+        self.assertIsNone(contract["commands"]["dynamics"])
+        self.assertEqual(contract["stages"]["dynamics"]["status"], "blocked")
+        self.assertEqual(
+            contract["stages"]["latent_stats"]["status"],
+            "pending",
+        )
+        self.assertFalse((self.run_dir / "commands" / "dynamics.command").exists())
 
     def test_missing_mismatched_or_wrong_split_manifest_is_rejected(self):
         with (
@@ -240,6 +278,15 @@ class PairedCoinRunTrainingTest(unittest.TestCase):
                     "dataset.categorical_action_dim=15",
                 ]
             )
+        with self.assertRaisesRegex(
+            PairedTrainingError,
+            "may not replace paired contract field",
+        ):
+            self._plan(
+                dynamics_overrides=[
+                    "dynamics.latent_mean=[0.0]",
+                ]
+            )
 
     def test_missing_action_space_is_rejected(self):
         manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
@@ -256,7 +303,7 @@ class PairedCoinRunTrainingTest(unittest.TestCase):
         ):
             self._plan()
 
-    def test_launch_orders_trainers_and_requires_tokenizer_checkpoint(self):
+    def test_launch_measures_stats_then_materializes_dynamics(self):
         plan = self._plan()
         publish_preflight_artifacts(plan)
         calls = []
@@ -265,17 +312,42 @@ class PairedCoinRunTrainingTest(unittest.TestCase):
             calls.append(command)
             if "train_tokenizer.py" in command[1]:
                 checkpoint_dir = self.run_dir / "tokenizer" / "checkpoints"
-                checkpoint_dir.mkdir(parents=True)
-                (checkpoint_dir / "step").write_text("1", encoding="utf-8")
+                (checkpoint_dir / "1").mkdir(parents=True)
+            elif "_tokenizer_probe" in command:
+                self._write_valid_stats(plan)
             return subprocess.CompletedProcess(command, 0)
 
         execute_training(plan, runner=successful_runner)
         self.assertIn("train_tokenizer.py", calls[0][1])
-        self.assertIn("train_dynamics.py", calls[1][1])
+        self.assertIn("_tokenizer_probe", calls[1])
+        self.assertIn("train_dynamics.py", calls[2][1])
+        self.assertTrue(
+            any(argument.startswith("dynamics.latent_mean=[") for argument in calls[2])
+        )
+        self.assertTrue(
+            any(argument.startswith("dynamics.latent_std=[") for argument in calls[2])
+        )
         contract = json.loads(
             (self.run_dir / RUN_CONTRACT_FILENAME).read_text(encoding="utf-8")
         )
         self.assertEqual(contract["status"], "completed")
+        self.assertEqual(
+            contract["latent_stats"]["sha256"],
+            sha256_file(self.run_dir / LATENT_STATS_FILENAME),
+        )
+        self.assertEqual(
+            contract["configs"]["dynamics_runtime"]["latent_mean"],
+            [0.125] * plan.latent_dimension,
+        )
+        runtime_config_path = self.run_dir / "configs" / "dynamics_runtime.json"
+        self.assertEqual(
+            contract["artifacts"]["configs"]["dynamics_runtime"]["sha256"],
+            sha256_file(runtime_config_path),
+        )
+        self.assertEqual(
+            contract["stages"]["latent_stats"]["status"],
+            "passed",
+        )
 
     def test_dynamics_is_blocked_when_tokenizer_produces_no_checkpoint(self):
         plan = self._plan()
@@ -296,6 +368,77 @@ class PairedCoinRunTrainingTest(unittest.TestCase):
             (self.run_dir / RUN_CONTRACT_FILENAME).read_text(encoding="utf-8")
         )
         self.assertEqual(contract["status"], "failed")
+
+    def test_missing_latent_stats_blocks_dynamics(self):
+        plan = self._plan()
+        publish_preflight_artifacts(plan)
+        calls = []
+
+        def runner_without_stats(command, **kwargs):
+            calls.append(command)
+            if "train_tokenizer.py" in command[1]:
+                (self.run_dir / "tokenizer" / "checkpoints" / "1").mkdir(parents=True)
+            return subprocess.CompletedProcess(command, 0)
+
+        with self.assertRaisesRegex(
+            PairedTrainingError,
+            "latent-stat artifact is missing",
+        ):
+            execute_training(plan, runner=runner_without_stats)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(any("train_dynamics.py" in command[1] for command in calls))
+        contract = json.loads(
+            (self.run_dir / RUN_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(contract["stages"]["latent_stats"]["status"], "failed")
+
+    def test_malformed_or_degenerate_latent_stats_block_dynamics(self):
+        for label in ("malformed", "degenerate"):
+            with self.subTest(label):
+                run_dir = self.tmp_path / f"run-{label}"
+                plan = self._plan(run_dir=run_dir)
+                publish_preflight_artifacts(plan)
+                calls = []
+
+                def runner(
+                    command,
+                    *,
+                    _calls=calls,
+                    _label=label,
+                    _plan=plan,
+                    _run_dir=run_dir,
+                    **kwargs,
+                ):
+                    _calls.append(command)
+                    if "train_tokenizer.py" in command[1]:
+                        (_run_dir / "tokenizer" / "checkpoints" / "1").mkdir(
+                            parents=True
+                        )
+                    elif "_tokenizer_probe" in command:
+                        if _label == "malformed":
+                            (_run_dir / LATENT_STATS_FILENAME).write_text(
+                                "{",
+                                encoding="utf-8",
+                            )
+                        else:
+                            stats_path = self._write_valid_stats(_plan)
+                            stats = json.loads(stats_path.read_text())
+                            stats["latent_std"][0] = 0.0
+                            stats_path.write_text(
+                                json.dumps(stats),
+                                encoding="utf-8",
+                            )
+                    return subprocess.CompletedProcess(command, 0)
+
+                with self.assertRaisesRegex(
+                    PairedTrainingError,
+                    "(malformed|invalid)",
+                ):
+                    execute_training(plan, runner=runner)
+                self.assertEqual(len(calls), 2)
+                self.assertFalse(
+                    any("train_dynamics.py" in command[1] for command in calls)
+                )
 
     def test_post_preflight_corpus_mutation_blocks_all_trainers(self):
         plan = self._plan()
