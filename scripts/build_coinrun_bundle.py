@@ -251,10 +251,8 @@ def build_manifest(
             "image_id": info["id"],
         },
         "base_image": {"reference": base_reference, "digest": base_digest},
-        # Hashes of the files that determine what ends up inside /opt/coinrun.
-        # scripts/coinrun_runner.py is shipped at /opt/coinrun/runner/, so the
-        # launcher gates on it. The Dockerfile and generator are recorded as
-        # rebuild triggers but not gated -- see the manifest section of
+        # Provenance for reconstruction. Only dependency-affecting entries gate
+        # a launch -- see "Provenance vs. compatibility" in
         # docs/ops/COINRUN_RUNNER_IMAGE.md.
         "build_inputs": build_inputs,
         "contract_env": contract_env,
@@ -288,12 +286,44 @@ BUILD_INPUTS = {
     "uv_lock_sha256": "uv.lock",
     "dockerfile_sha256": "Dockerfile",
     "generator_sha256": "dreamer/data/generate_coinrun_dataset.py",
-    "coinrun_runner_sha256": "scripts/coinrun_runner.py",
+}
+# Hashed over its PEP 723 inline metadata only. That block pins Procgen, whose
+# built wheel is prewarmed into the bundle's uv cache, so it genuinely changes
+# the payload; the generator's body runs from the checkout and does not.
+DEPENDENCY_INPUTS = {
+    "generator_dependency_sha256": "dreamer/data/generate_coinrun_dataset.py",
 }
 
 
+def script_dependency_sha256(path: Path) -> str:
+    """Hash a PEP 723 inline metadata block, or the whole file if it has none."""
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    block: list[str] = []
+    inside = False
+    for line in lines:
+        stripped = line.strip()
+        if not inside and stripped == "# /// script":
+            inside = True
+            block.append(stripped)
+            continue
+        if inside:
+            block.append(stripped)
+            if stripped == "# ///":
+                break
+    payload = "\n".join(block) if block else "\n".join(lines)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def collect_build_inputs() -> dict[str, str]:
-    return {key: sha256_file(REPO_ROOT / path) for key, path in BUILD_INPUTS.items()}
+    """Provenance for reconstruction. Only DEPENDENCY_INPUTS gate a launch."""
+
+    inputs = {key: sha256_file(REPO_ROOT / path) for key, path in BUILD_INPUTS.items()}
+    inputs.update(
+        {key: script_dependency_sha256(REPO_ROOT / path)
+         for key, path in DEPENDENCY_INPUTS.items()}
+    )
+    return inputs
 
 
 def append_telemetry(record: dict[str, Any]) -> None:

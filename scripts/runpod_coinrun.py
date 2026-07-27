@@ -933,8 +933,14 @@ MAX_SETUP_TIMEOUT_SECONDS = 60 * 60
 REMOTE_STAGING_DIR = "/workspace/coinrun-bundle"
 # Build inputs whose change invalidates an existing bundle. Enforced only when
 # the manifest records them, so manifests built before this field stay usable.
+# Only inputs that change the *dependencies* baked into /opt/coinrun may gate a
+# launch. Orchestration code (this launcher, scripts/coinrun_runner.py, docs)
+# runs from the pinned checkout, so it can never stale a bundle.
+#   generator_dependency_sha256 hashes the dataset generator's PEP 723 inline
+#   metadata block only -- the Procgen pin whose built wheel is prewarmed into
+#   the bundle's uv cache. Its body runs from the checkout and is irrelevant.
 GATED_BUNDLE_INPUTS = {
-    "scripts/coinrun_runner.py": "coinrun_runner_sha256",
+    "dreamer/data/generate_coinrun_dataset.py": "generator_dependency_sha256",
 }
 SSH_USER = "root"
 
@@ -990,20 +996,20 @@ def validate_bundle_manifest(
     # commit that contains it -- runtime checkout identity is enforced
     # separately by --expect-commit. Gate only on inputs that actually change
     # what is inside /opt/coinrun:
-    #   uv.lock                   -> the venv (checked above)
-    #   scripts/coinrun_runner.py -> shipped at /opt/coinrun/runner/, so a stale
-    #                                bundle would run stale runner code
-    # The Dockerfile and the dataset generator are recorded as rebuild triggers
-    # but not gated: most edits to them (comments, layer order, labels, the
-    # generator's body, which runs from the checkout) leave the payload
-    # identical, and failing closed there would force no-op rebuilds.
+    #   uv.lock                      -> the venv (checked above)
+    #   the generator's PEP 723 block -> the Procgen wheel prewarmed into the
+    #                                    bundle's uv cache
+    # Everything else -- the Dockerfile, this launcher, scripts/coinrun_runner.py,
+    # docs -- is recorded for provenance but never gates: it either runs from
+    # the pinned checkout or leaves the payload identical, and failing closed
+    # there would force no-op 3GB rebuilds.
     inputs = manifest.get("build_inputs")
     if isinstance(inputs, dict):
         for relative_path, key in GATED_BUNDLE_INPUTS.items():
             recorded = inputs.get(key)
             if not recorded:
                 continue
-            actual = sha256_file(repo_root / relative_path)
+            actual = script_dependency_sha256(repo_root / relative_path)
             if actual != recorded:
                 raise DeploymentError(
                     f"bundle is stale: {relative_path} is {actual} but the bundle "
@@ -1051,6 +1057,31 @@ def validate_bundle_manifest(
         archive_path=archive_path,
         base_image=f"{repository}@{digest}",
     )
+
+
+def script_dependency_sha256(path: Path) -> str:
+    """Hash a PEP 723 inline metadata block, or the whole file if it has none.
+
+    The dataset generator's dependency pins are baked into the bundle's uv
+    cache; its body is not. Hashing only the block means a body edit does not
+    invalidate a 3GB archive.
+    """
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    block: list[str] = []
+    inside = False
+    for line in lines:
+        stripped = line.strip()
+        if not inside and stripped == "# /// script":
+            inside = True
+            block.append(stripped)
+            continue
+        if inside:
+            block.append(stripped)
+            if stripped == "# ///":
+                break
+    payload = "\n".join(block) if block else "\n".join(lines)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def read_public_key(path: Path) -> str:
@@ -1274,9 +1305,15 @@ test -x "$target/venv/bin/python" || { echo "venv python missing" >&2; exit 14; 
 "$target/venv/bin/python" -c 'import jax, flax, optax'   || { echo "venv imports failed" >&2; exit 15; }
 test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "Procgen libenv.so missing from the uv cache" >&2; exit 16; }
 # The image builds /usr/local/bin/coinrun-runner outside /opt/coinrun, so the
-# bundle cannot carry it. Recreate it from the payload we just installed.
-printf '#!/bin/sh\nexec %s/venv/bin/python %s/runner/coinrun_runner.py "$@"\n' \
-  "$target" "$target" > /usr/local/bin/coinrun-runner
+# bundle cannot carry it. Recreate it -- but pointing at the pinned runtime
+# checkout, never at the copy inside the archive. The bundle is a dependency
+# environment; executable orchestration comes from the exact commit, which the
+# bootstrap has already verified. This also makes the archive's own
+# runner/coinrun_runner.py inert, so launcher-only edits never require a 3GB
+# rebuild. COINRUN_CHECKOUT_ROOT is exported by the bootstrap before the
+# experiment command runs.
+printf '#!/bin/sh\nexec %s/venv/bin/python "${COINRUN_CHECKOUT_ROOT:-/workspace/open-dreamer}/scripts/coinrun_runner.py" "$@"\n' \
+  "$target" > /usr/local/bin/coinrun-runner
 chmod 0755 /usr/local/bin/coinrun-runner
 command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 17; }
 

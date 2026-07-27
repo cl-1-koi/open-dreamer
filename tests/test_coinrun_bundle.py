@@ -341,20 +341,54 @@ class ProvenanceVersusCompatibilityTests(unittest.TestCase):
                 rc.run_launch(args, api_factory=lambda k: api)
             self.assertEqual(api.created, [])
 
-    def test_in_bundle_runner_source_gates_when_recorded(self):
-        # scripts/coinrun_runner.py ships at /opt/coinrun/runner/, so a stale
-        # bundle would run stale runner code.
+    def test_generator_dependency_pins_gate_when_recorded(self):
+        # The generator's PEP 723 block pins Procgen, whose built wheel is
+        # prewarmed into the bundle's uv cache.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path, bundle_dir, manifest, _ = write_bundle(root)
-            (root / "scripts").mkdir()
-            (root / "scripts" / "coinrun_runner.py").write_bytes(b"current\n")
-            manifest["build_inputs"] = {"coinrun_runner_sha256": "9" * 64}
+            generator = root / "dreamer" / "data" / "generate_coinrun_dataset.py"
+            generator.parent.mkdir(parents=True)
+            generator.write_text(
+                "# /// script\n# dependencies = ['procgen@new']\n# ///\nbody\n",
+                encoding="utf-8",
+            )
+            manifest["build_inputs"] = {"generator_dependency_sha256": "9" * 64}
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaises(rc.DeploymentError) as caught:
                 plan_for(root, manifest_path, bundle_dir)
         self.assertIn("bundle is stale", str(caught.exception))
-        self.assertIn("scripts/coinrun_runner.py", str(caught.exception))
+
+    def test_generator_body_changes_do_not_stale_the_bundle(self):
+        # Only the dependency block is hashed; the body runs from the checkout.
+        header = "# /// script\n# dependencies = ['procgen@pinned']\n# ///\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            generator = root / "dreamer" / "data" / "generate_coinrun_dataset.py"
+            generator.parent.mkdir(parents=True)
+            generator.write_text(header + "original body\n", encoding="utf-8")
+            recorded = rc.script_dependency_sha256(generator)
+            manifest["build_inputs"] = {"generator_dependency_sha256": recorded}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            generator.write_text(header + "a completely different body\n", encoding="utf-8")
+            plan_for(root, manifest_path, bundle_dir)  # must not raise
+
+    def test_launcher_and_runner_scripts_never_gate_a_bundle(self):
+        # Orchestration runs from the pinned checkout, so it cannot stale a
+        # dependency archive; gating on it would force 3GB no-op rebuilds.
+        self.assertNotIn("scripts/coinrun_runner.py", rc.GATED_BUNDLE_INPUTS)
+        self.assertNotIn("scripts/runpod_coinrun.py", rc.GATED_BUNDLE_INPUTS)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
+            manifest["build_inputs"] = {
+                "coinrun_runner_sha256": "9" * 64,
+                "dockerfile_sha256": "9" * 64,
+                "generator_sha256": "9" * 64,
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            plan_for(root, manifest_path, bundle_dir)  # must not raise
 
     def test_manifests_without_build_inputs_stay_usable(self):
         # The checked-in manifest predates build_inputs; it must not break.
@@ -364,17 +398,11 @@ class ProvenanceVersusCompatibilityTests(unittest.TestCase):
             self.assertNotIn("build_inputs", manifest)
             plan_for(root, manifest_path, bundle_dir)
 
-    def test_dockerfile_and_generator_are_recorded_but_not_gated(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            manifest_path, bundle_dir, manifest, _ = write_bundle(root)
-            manifest["build_inputs"] = {
-                "dockerfile_sha256": "9" * 64,
-                "generator_sha256": "9" * 64,
-            }
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            plan_for(root, manifest_path, bundle_dir)  # must not raise
-        self.assertEqual(set(rc.GATED_BUNDLE_INPUTS), {"scripts/coinrun_runner.py"})
+    def test_only_dependency_affecting_inputs_gate(self):
+        self.assertEqual(
+            set(rc.GATED_BUNDLE_INPUTS),
+            {"dreamer/data/generate_coinrun_dataset.py"},
+        )
 
 
 class BundleShimTests(unittest.TestCase):
@@ -384,8 +412,31 @@ class BundleShimTests(unittest.TestCase):
         # experiment command is command-not-found on the pod.
         script = rc.REMOTE_BUNDLE_SETUP
         self.assertIn("/usr/local/bin/coinrun-runner", script)
-        self.assertIn("runner/coinrun_runner.py", script)
         self.assertIn("command -v coinrun-runner", script)
+
+    def test_shim_execs_the_pinned_checkout_not_the_bundled_copy(self):
+        # The bundle is a dependency environment. Orchestration must come from
+        # the exact commit the bootstrap checked out and verified.
+        script = rc.REMOTE_BUNDLE_SETUP
+        self.assertIn(
+            '"${COINRUN_CHECKOUT_ROOT:-/workspace/open-dreamer}/scripts/coinrun_runner.py"',
+            script,
+        )
+        # The archive's own copy must be inert.
+        self.assertNotIn("$target/runner/coinrun_runner.py", script)
+        self.assertNotIn("runner/coinrun_runner.py\\n' \\\n  \"$target\" \"$target\"", script)
+
+    def test_shim_still_uses_the_bundled_interpreter(self):
+        # Python and its packages do come from the bundle.
+        self.assertIn("%s/venv/bin/python", rc.REMOTE_BUNDLE_SETUP)
+
+    def test_bootstrap_exports_the_checkout_root_the_shim_reads(self):
+        script = rc.build_remote_script(
+            branch="b", commit_sha=COMMIT, experiment_command="true",
+            runtime_seconds=60, artifact_dir="/workspace/a", stream_token="t",
+            deadline_epoch=2_000_000_000,
+        )
+        self.assertIn('COINRUN_CHECKOUT_ROOT="$REPO_DIR"', script)
 
 
 class PublicKeyTests(unittest.TestCase):

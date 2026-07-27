@@ -209,17 +209,43 @@ checkout, as long as the build inputs match.
 
 Rebuild the image and the bundle when any of these change:
 
+The bundle is a **dependency environment**. Only inputs that change the
+dependencies baked into `/opt/coinrun` may gate a launch. All executable
+orchestration runs from the pinned runtime checkout, so it can never stale a
+bundle.
+
 | Input | Gated? | Why |
 |---|---|---|
 | `uv.lock` | **yes, fails closed** | Determines the venv contents |
-| `scripts/coinrun_runner.py` | **yes, fails closed** | Ships inside the bundle at `/opt/coinrun/runner/`, so a stale bundle runs stale runner code |
-| `Dockerfile` | recorded, not gated | Most edits (comments, layer order, labels) leave `/opt/coinrun` byte-identical; rebuild when you change apt packages, the `uv sync` flags, the prewarm, or the base |
-| `dreamer/data/generate_coinrun_dataset.py` | recorded, not gated | Only its PEP 723 header (the Procgen pin) affects the cached wheel; the body runs from the checkout at runtime |
-| `scripts/build_coinrun_bundle.py` | no | Packaging logic only; changes the archive, not its semantic content |
+| PEP 723 block of `dreamer/data/generate_coinrun_dataset.py` | **yes, fails closed** | Pins Procgen, whose built wheel is prewarmed into the bundle's uv cache |
+| Base image digest | rebuild manually | A different base changes the ABI the venv was built against |
+| Dockerfile apt/`uv sync`/prewarm steps | rebuild manually | They assemble `/opt/coinrun`; recorded via `dockerfile_sha256` but not gated, since comments and layer order leave the payload identical |
+| That generator's **body** | no | Runs from the checkout at runtime |
+| `scripts/coinrun_runner.py` | **no** | Executed from the checkout via the shim below, never from the archive |
+| `scripts/runpod_coinrun.py`, docs | no | Launcher-side only; never enter the bundle |
+| `scripts/build_coinrun_bundle.py` | no | Packaging logic; changes the archive, not its semantic content |
 
-Do **not** rebuild merely to advance `source.commit`. Gated hashes live under
-`build_inputs` in the manifest and are enforced only when present, so manifests
-written before that field remain usable.
+So: rebuild for dependency, base, or prewarm changes. Do **not** rebuild for
+docs, launcher, or runner changes — and never merely to advance
+`source.commit`. Gated hashes live under `build_inputs` and are enforced only
+when present, so manifests written before that field remain usable.
+
+#### Where the runner executable comes from
+
+In bundle mode the setup step recreates `/usr/local/bin/coinrun-runner` as:
+
+```sh
+exec /opt/coinrun/venv/bin/python \
+  "${COINRUN_CHECKOUT_ROOT:-/workspace/open-dreamer}/scripts/coinrun_runner.py" "$@"
+```
+
+The interpreter and its packages come from the bundle; the orchestration code
+comes from the exact commit the bootstrap cloned and verified, which exports
+`COINRUN_CHECKOUT_ROOT` before running the experiment command. The archive's own
+`runner/coinrun_runner.py` is inert.
+
+Image mode is unchanged: its baked shim runs the image's copy, which is pinned
+by the image's immutable digest or `sha-<commit>` tag.
 
 ## Image transport (legacy, optional)
 
