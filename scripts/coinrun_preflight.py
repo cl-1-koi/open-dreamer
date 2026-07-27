@@ -374,9 +374,9 @@ def build_default_dataset_command(
         "--isolated",
         "--script",
         str(generator),
-        "--num-episodes-train=2",
-        "--num-episodes-val=1",
-        "--num-episodes-test=1",
+        "--num-episodes-train=4",
+        "--num-episodes-val=4",
+        "--num-episodes-test=2",
         f"--output-dir={dataset_dir}",
         f"--min-episode-length={sequence_length}",
         f"--max-episode-length={DEFAULT_DATASET_MAX_EPISODE_LENGTH}",
@@ -1325,16 +1325,21 @@ def validate_dataset_gates(
         errors.append("dataset records contain no episode end boundary")
     minimum_record_length = stats.get("minimum_record_length")
     minimum_by_split = stats.get("minimum_record_length_by_split", {})
+    length_histograms = stats.get("record_length_histogram_by_split", {})
+    usable_records_by_split: dict[str, int] = {}
     if required_sequence_length is not None:
         for split in ("train", "val"):
-            split_minimum = minimum_by_split.get(split)
-            if (
-                not isinstance(split_minimum, int)
-                or split_minimum < required_sequence_length
-            ):
+            histogram = length_histograms.get(split, {})
+            usable = sum(
+                int(count)
+                for length, count in histogram.items()
+                if int(length) >= required_sequence_length
+            )
+            usable_records_by_split[split] = usable
+            if usable == 0:
                 errors.append(
-                    f"minimum {split} record length {split_minimum!r} is shorter "
-                    f"than training window {required_sequence_length}"
+                    f"{split} split has no records usable for training window "
+                    f"{required_sequence_length}"
                 )
 
     if errors:
@@ -1353,6 +1358,7 @@ def validate_dataset_gates(
         "reward_prevalence": stats.get("reward_prevalence"),
         "minimum_record_length": minimum_record_length,
         "minimum_record_length_by_split": minimum_by_split,
+        "usable_records_by_split": usable_records_by_split,
         "required_sequence_length": required_sequence_length,
     }
 
@@ -1651,6 +1657,13 @@ def summarize_dataset_records(
         },
         "maximum_record_length_by_split": {
             split: max(lengths)
+            for split, lengths in sorted(record_lengths_by_split.items())
+        },
+        "record_length_histogram_by_split": {
+            split: {
+                str(length): count
+                for length, count in sorted(Counter(lengths).items())
+            }
             for split, lengths in sorted(record_lengths_by_split.items())
         },
     }

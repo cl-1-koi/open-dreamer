@@ -181,6 +181,9 @@ class DatasetTelemetryTests(unittest.TestCase):
         self.assertIn("--min-episode-length=16", command)
         self.assertIn("--max-episode-length=256", command)
         self.assertIn("--chunk-size=256", command)
+        self.assertIn("--num-episodes-train=4", command)
+        self.assertIn("--num-episodes-val=4", command)
+        self.assertIn("--num-episodes-test=2", command)
         self.assertIn("--keep-short-terminated", command)
         self.assertIn("--seed=7", command)
         self.assertNotIn(sys.executable, command)
@@ -248,6 +251,11 @@ class FailClosedGateTests(unittest.TestCase):
                 "val": 16,
                 "test": 8,
             },
+            "record_length_histogram_by_split": {
+                "train": {"16": 2},
+                "val": {"16": 1},
+                "test": {"8": 1},
+            },
         }
         self.metadata = {
             "num_actions": 15,
@@ -278,7 +286,7 @@ class FailClosedGateTests(unittest.TestCase):
         self.dataset_config["categorical_noop"] = None
         self.stats["level_seeds_by_split"]["val"] = [2]
         self.stats["reward_nonzero_frames"] = 0
-        self.stats["minimum_record_length_by_split"]["val"] = 15
+        self.stats["record_length_histogram_by_split"]["val"] = {"15": 1}
 
         with self.assertRaises(PreflightError) as context:
             validate_dataset_gates(
@@ -293,7 +301,7 @@ class FailClosedGateTests(unittest.TestCase):
         self.assertIn("categorical_noop=None", message)
         self.assertIn("level seed sets overlap", message)
         self.assertIn("nonzero-reward frames are zero", message)
-        self.assertIn("minimum val record length 15", message)
+        self.assertIn("val split has no records usable", message)
 
     def test_dynamics_requires_action_contract_and_explicit_latent_stats(self):
         good = {

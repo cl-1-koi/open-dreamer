@@ -88,7 +88,10 @@ class GPUOffer:
     def available(self) -> bool:
         return (
             self.stock_status.lower() != "none"
-            and 1 in self.available_gpu_counts
+            and (
+                not self.available_gpu_counts
+                or 1 in self.available_gpu_counts
+            )
             and self.hourly_price > 0
         )
 

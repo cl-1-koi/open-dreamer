@@ -325,6 +325,17 @@ class DiscoveryAndRemoteBootstrapTests(unittest.TestCase):
         )
         self.assertFalse(result.offers["B200"].available)
 
+    def test_null_gpu_counts_use_stock_status_as_current_api_fallback(self):
+        payload = discovery_payload()
+        payload["h100"][0]["lowestPrice"]["availableGpuCounts"] = None
+
+        result = runpod_coinrun.discover_runpod(
+            FakeAPI(discovery=payload), "secure"
+        )
+
+        self.assertTrue(result.offers["H100"].available)
+        self.assertEqual(result.offers["H100"].available_gpu_counts, ())
+
     def test_remote_script_pins_github_branch_commit_and_both_bounds(self):
         script = runpod_coinrun.build_remote_script(
             branch=BRANCH,
