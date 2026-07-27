@@ -722,7 +722,22 @@ def build_training_plan(
         tokenizer_checkpoint=tokenizer_checkpoint,
     )
 
-    python_executable = str(Path(python_executable).expanduser().resolve())
+    # Do not resolve this path. Virtual-environment Python executables are
+    # commonly symlinks to a base interpreter; dereferencing that symlink drops
+    # the venv's site-packages when the child process starts.
+    python_path = Path(python_executable).expanduser()
+    if not python_path.is_absolute():
+        located_python = shutil.which(str(python_path))
+        if located_python is None:
+            raise PairedTrainingError(
+                f"Python executable is not available on PATH: {python_path}."
+            )
+        python_path = Path(located_python)
+    if not python_path.is_file() or not os.access(python_path, os.X_OK):
+        raise PairedTrainingError(
+            f"Python executable is missing or not executable: {python_path}."
+        )
+    python_executable = str(python_path.absolute())
     tokenizer_command = (
         python_executable,
         str(repo_root / "scripts" / "train_tokenizer.py"),

@@ -230,6 +230,15 @@ class ImageContractTests(unittest.TestCase):
             # It must tell the operator to rebuild, not to sync on the pod.
             self.assertIn("republish the runner image", message)
 
+    def test_dependency_gate_covers_direct_training_imports(self):
+        for module in (
+            "einops",
+            "jaxlpips",
+            "omegaconf",
+            "tqdm",
+        ):
+            self.assertIn(module, runner.REQUIRED_IMPORTS)
+
     def test_missing_image_contract_env_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             checkout, lock_sha, commit = make_checkout(Path(directory))

@@ -34,7 +34,20 @@ SUPPORTED_GPUS = ("H100", "H200", "B200")
 REQUIRED_BINARIES = (
     "git", "uv", "coinrun-dataset-python", "timeout", "grep", "ffmpeg", "nvidia-smi"
 )
-REQUIRED_IMPORTS = ("jax", "flax", "optax", "grain", "hydra", "imageio", "array_record")
+REQUIRED_IMPORTS = (
+    "array_record",
+    "einops",
+    "flax",
+    "grain",
+    "hydra",
+    "imageio",
+    "jax",
+    "jaxlpips",
+    "numpy",
+    "omegaconf",
+    "optax",
+    "tqdm",
+)
 # Two episodes per split proves the Procgen toolchain and record round-trip.
 # Dataset scale for real runs lives in the experiment controller.
 SMOKE_EPISODES = 2

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -179,6 +180,18 @@ class PairedCoinRunTrainingTest(unittest.TestCase):
                 for argument in command
             )
         )
+
+    def test_plan_preserves_virtual_environment_python_symlink(self):
+        interpreter_dir = self.tmp_path / "venv" / "bin"
+        interpreter_dir.mkdir(parents=True)
+        interpreter = interpreter_dir / "python"
+        interpreter.symlink_to(Path(os.__file__).parents[2] / "bin" / "python3")
+
+        plan = self._plan(python_executable=interpreter)
+
+        self.assertEqual(plan.python_executable, str(interpreter))
+        self.assertEqual(plan.tokenizer_command[0], str(interpreter))
+        self.assertEqual(plan.tokenizer_probe_command[0], str(interpreter))
 
     def test_preflight_artifacts_record_manifest_hash_and_source_splits(self):
         plan = self._plan()
