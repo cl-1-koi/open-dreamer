@@ -20,6 +20,17 @@
 # duplicate layer. The builder assembles and prunes /opt/coinrun; the final
 # stage copies the finished tree once, so the published image contains exactly
 # one copy of it.
+#
+# LAYER-ORDER RULE. BuildKit folds every in-scope ARG into the cache key of each
+# subsequent RUN -- visible in `docker history` as `RUN |3 SOURCE_COMMIT=... `.
+# Declaring the per-commit metadata ARGs near the top therefore invalidated apt,
+# `uv sync` and the Procgen prewarm on every source-only commit (measured: a
+# SOURCE_COMMIT-only change forced a 74.8s rebuild instead of the 0.5s fully
+# cached path). So: the builder never sees SOURCE_COMMIT/SOURCE_REPO at all, and
+# in the final stage every ARG/LABEL/ENV carrying per-commit values is declared
+# AFTER the last expensive RUN and COPY. Nothing at build time reads the
+# COINRUN_* contract variables -- they are only read at pod runtime -- so
+# declaring them last costs no correctness.
 
 ARG BASE_IMAGE=runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.10.4
@@ -27,22 +38,14 @@ ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.10.4
 FROM ${UV_IMAGE} AS uv-src
 
 
+# --------------------------------------------------------------------------
+# Builder: assemble /opt/coinrun. Depends only on uv.lock, pyproject.toml and
+# the dataset generator. No LABEL here (labels on a non-final stage are
+# discarded) and no source-identity ARGs.
+# --------------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS builder
 
-ARG SOURCE_COMMIT=unknown
-ARG UV_LOCK_SHA256=unknown
-ARG SOURCE_REPO=https://github.com/cl-1-koi/open-dreamer
-
-LABEL org.opencontainers.image.title="open-dreamer-coinrun-runner" \
-      org.opencontainers.image.source="${SOURCE_REPO}" \
-      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
-      org.opencontainers.image.licenses="LicenseRef-All-Rights-Reserved" \
-      io.coinrun.uv.lock.sha256="${UV_LOCK_SHA256}"
-
-ENV COINRUN_IMAGE_CONTRACT=1 \
-    COINRUN_SOURCE_COMMIT=${SOURCE_COMMIT} \
-    COINRUN_UV_LOCK_SHA256=${UV_LOCK_SHA256} \
-    DEBIAN_FRONTEND=noninteractive \
+ENV DEBIAN_FRONTEND=noninteractive \
     UV_PROJECT_ENVIRONMENT=/opt/coinrun/venv \
     UV_CACHE_DIR=/opt/coinrun/uv-cache \
     UV_PYTHON_INSTALL_DIR=/opt/coinrun/python \
@@ -77,6 +80,12 @@ WORKDIR /opt/coinrun/build
 # also keeps those wheels out of /opt/coinrun/uv-cache entirely, which is why no
 # `uv cache prune` is needed afterwards.
 COPY pyproject.toml uv.lock README.md ./
+
+# Declared here, immediately before its only use, so apt and `uv python install`
+# above are not rekeyed by it. It changes exactly when uv.lock changes, which
+# already invalidates the COPY above, so it costs no extra rebuild.
+ARG UV_LOCK_SHA256=unknown
+
 RUN --mount=type=cache,id=coinrun-uv-build,target=/root/.cache/uv-build,sharing=locked \
     UV_CACHE_DIR=/root/.cache/uv-build \
     uv sync --frozen --no-install-project \
@@ -104,25 +113,14 @@ RUN rm -rf /opt/coinrun/build \
     && test -n "$(find /opt/coinrun/uv-cache -name libenv.so -print -quit)"
 
 
+# --------------------------------------------------------------------------
+# Final stage: static dependency layers first, per-commit metadata last.
+# --------------------------------------------------------------------------
 FROM ${BASE_IMAGE}
 
-ARG SOURCE_COMMIT=unknown
-ARG UV_LOCK_SHA256=unknown
-ARG SOURCE_REPO=https://github.com/cl-1-koi/open-dreamer
-
-LABEL org.opencontainers.image.title="open-dreamer-coinrun-runner" \
-      org.opencontainers.image.source="${SOURCE_REPO}" \
-      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
-      org.opencontainers.image.licenses="LicenseRef-All-Rights-Reserved" \
-      io.coinrun.uv.lock.sha256="${UV_LOCK_SHA256}"
-
-# The runner contract, read by scripts/coinrun_runner.py and by the remote
-# bootstrap in scripts/runpod_coinrun.py. Labels above mirror it for
-# `docker inspect`; env is what the pod actually checks.
-ENV COINRUN_IMAGE_CONTRACT=1 \
-    COINRUN_SOURCE_COMMIT=${SOURCE_COMMIT} \
-    COINRUN_UV_LOCK_SHA256=${UV_LOCK_SHA256} \
-    DEBIAN_FRONTEND=noninteractive \
+# Static environment only. The per-commit COINRUN_* contract variables are set
+# at the bottom of this file, after the expensive layers.
+ENV DEBIAN_FRONTEND=noninteractive \
     UV_PROJECT_ENVIRONMENT=/opt/coinrun/venv \
     UV_CACHE_DIR=/opt/coinrun/uv-cache \
     UV_PYTHON_INSTALL_DIR=/opt/coinrun/python \
@@ -149,6 +147,27 @@ RUN printf '#!/bin/sh\nexec /opt/coinrun/venv/bin/python /opt/coinrun/runner/coi
     && chmod 0755 /usr/local/bin/coinrun-runner
 
 WORKDIR /workspace
+
+# --- per-commit metadata: everything below is rekeyed on every commit ---
+# Nothing after this point runs a command or copies a payload, so a
+# source-only change rewrites metadata layers and nothing else.
+ARG SOURCE_COMMIT=unknown
+ARG UV_LOCK_SHA256=unknown
+ARG SOURCE_REPO=https://github.com/cl-1-koi/open-dreamer
+
+LABEL org.opencontainers.image.title="open-dreamer-coinrun-runner" \
+      org.opencontainers.image.source="${SOURCE_REPO}" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.licenses="LicenseRef-All-Rights-Reserved" \
+      io.coinrun.uv.lock.sha256="${UV_LOCK_SHA256}"
+
+# The runner contract, read by scripts/coinrun_runner.py and by the remote
+# bootstrap in scripts/runpod_coinrun.py. Labels above mirror it for
+# `docker inspect`; env is what the pod actually checks. Read only at pod
+# runtime, never during the build, which is why it can be declared last.
+ENV COINRUN_IMAGE_CONTRACT=1 \
+    COINRUN_SOURCE_COMMIT=${SOURCE_COMMIT} \
+    COINRUN_UV_LOCK_SHA256=${UV_LOCK_SHA256}
 
 # Exec-form ENTRYPOINT plus a separate CMD: `docker run IMAGE` smokes, and
 # `docker run IMAGE experiment` replaces only the CMD. Commit 10a0252 fixed the

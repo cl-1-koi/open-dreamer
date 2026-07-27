@@ -235,3 +235,19 @@ is stated as `docker image inspect` total (26,461,584,632 B) minus our single
 
 The download cache mount is a build-time artifact only; the pod never depends
 on it.
+
+## Layer ordering and commit-only rebuilds
+
+BuildKit folds every in-scope `ARG` into the cache key of each later `RUN`
+(visible in `docker history` as `RUN |3 SOURCE_COMMIT=... `). Declaring the
+per-commit metadata near the top of a stage therefore rebuilt apt, `uv sync`
+and the Procgen prewarm on every source-only commit -- measured at 74.8 s for a
+`SOURCE_COMMIT`-only change versus 0.5 s for a fully cached build.
+
+The Dockerfile now keeps `SOURCE_COMMIT`/`SOURCE_REPO` out of the builder
+entirely, and in the final stage declares every per-commit `ARG`/`LABEL`/`ENV`
+after the last `RUN` and `COPY`. `UV_LOCK_SHA256` is declared in the builder
+immediately before the `uv sync` that verifies against it, so it rekeys only
+what `uv.lock` already invalidates. Nothing reads the `COINRUN_*` contract
+variables at build time -- only at pod runtime -- so declaring them last costs
+no correctness. `tests/test_coinrun_runner.py` pins this ordering.

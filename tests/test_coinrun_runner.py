@@ -78,6 +78,37 @@ def make_checkout(root: Path, lock_body: str = "lock-body\n") -> tuple[Path, str
     return checkout, hashlib.sha256(lock_body.encode()).hexdigest(), commit
 
 
+def dockerfile_stages(text: str) -> dict[str, list[str]]:
+    """Split a Dockerfile into stages keyed by alias (final stage: "final")."""
+    stages: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("FROM "):
+            parts = line.split()
+            alias = parts[parts.index("AS") + 1] if "AS" in parts else "final"
+            current = stages.setdefault(alias, [])
+            continue
+        if current is not None and line and not line.startswith("#"):
+            current.append(line)
+    return stages
+
+
+def first_index(lines: list[str], *prefixes: str) -> int:
+    for index, line in enumerate(lines):
+        if line.startswith(prefixes):
+            return index
+    return -1
+
+
+def last_index(lines: list[str], *prefixes: str) -> int:
+    found = -1
+    for index, line in enumerate(lines):
+        if line.startswith(prefixes):
+            found = index
+    return found
+
+
 class DockerfileContractTests(unittest.TestCase):
     """The 10a0252 regression was an entrypoint swallowing CMD; pin the shape."""
 
@@ -114,6 +145,43 @@ class DockerfileContractTests(unittest.TestCase):
         self.assertIn("generate_coinrun_dataset.py", self.text)
         self.assertIn("-name libenv.so", self.text)
         self.assertIn("rm -rf /tmp/procgen-warmup", self.text)
+
+    def test_builder_does_not_depend_on_per_commit_source_metadata(self):
+        # BuildKit folds in-scope ARGs into every later RUN cache key, so a
+        # SOURCE_COMMIT reference here would rebuild apt/uv sync/Procgen on
+        # every source-only commit.
+        builder = dockerfile_stages(self.text)["builder"]
+        joined = "\n".join(builder)
+        self.assertNotIn("SOURCE_COMMIT", joined)
+        self.assertNotIn("SOURCE_REPO", joined)
+        self.assertNotIn("LABEL", joined, "labels on a non-final stage are discarded")
+
+    def test_builder_lock_arg_is_declared_after_the_expensive_apt_layer(self):
+        builder = dockerfile_stages(self.text)["builder"]
+        lock_arg = first_index(builder, "ARG UV_LOCK_SHA256")
+        self.assertGreater(lock_arg, first_index(builder, "RUN apt-get"))
+        self.assertGreater(lock_arg, first_index(builder, "RUN uv python install"))
+        # ...and before the sync that verifies against it.
+        self.assertLess(lock_arg, first_index(builder, "RUN --mount=type=cache"))
+
+    def test_final_stage_declares_source_metadata_after_every_expensive_step(self):
+        final = dockerfile_stages(self.text)["final"]
+        metadata = first_index(final, "ARG SOURCE_COMMIT", "ARG UV_LOCK_SHA256", "LABEL ")
+        self.assertGreater(metadata, 0, "source metadata must exist in the final stage")
+        for prefix in ("RUN ", "COPY "):
+            self.assertLess(
+                last_index(final, prefix), metadata,
+                f"a {prefix.strip()} step follows the per-commit metadata and would be rekeyed",
+            )
+
+    def test_contract_env_is_split_from_static_env(self):
+        final = dockerfile_stages(self.text)["final"]
+        static_env = first_index(final, "ENV DEBIAN_FRONTEND")
+        contract_env = first_index(final, "ENV COINRUN_IMAGE_CONTRACT=1")
+        self.assertGreater(contract_env, static_env)
+        # The static block must not carry per-commit values.
+        self.assertNotIn("COINRUN_SOURCE_COMMIT", final[static_env])
+        self.assertLess(first_index(final, "RUN apt-get"), contract_env)
 
     def test_no_credentials_or_datasets_are_baked_in(self):
         lowered = self.text.lower()
