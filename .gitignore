@@ -271,3 +271,4 @@ artifacts/coinrun_runner/
 # CoinRun dependency bundle archives (content-addressed, reconstructable from
 # manifests/coinrun_runner_bundle.json). Never committed.
 artifacts/coinrun_bundle/
+artifacts/coinrun_preflight/
