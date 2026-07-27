@@ -272,3 +272,4 @@ artifacts/coinrun_runner/
 # manifests/coinrun_runner_bundle.json). Never committed.
 artifacts/coinrun_bundle/
 artifacts/coinrun_preflight/
+artifacts/coinrun_visual_6000/
