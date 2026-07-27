@@ -41,6 +41,7 @@ REST_URL = "https://rest.runpod.io/v1"
 DEFAULT_IMAGE = (
     "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"
 )
+PROXY_USER_AGENT = "cl-1-koi-open-dreamer-coinrun-monitor/1"
 DEFAULT_STATE = (
     Path(__file__).resolve().parents[1]
     / "artifacts"
@@ -881,7 +882,11 @@ def fetch_log_chunk(
         {"offset": offset, "token": stream_token}
     )
     url = f"https://{pod_id}-8000.proxy.runpod.net/log?{query}"
-    request = urllib.request.Request(url, method="GET")
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": PROXY_USER_AGENT},
+        method="GET",
+    )
     try:
         with opener(request, timeout=timeout) as response:
             data = response.read()
@@ -909,7 +914,11 @@ def fetch_manifest(
         "artifact-manifest.json?"
         + urllib.parse.urlencode({"token": stream_token})
     )
-    request = urllib.request.Request(url, method="GET")
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": PROXY_USER_AGENT},
+        method="GET",
+    )
     try:
         with opener(request, timeout=timeout) as response:
             data = response.read(8 * 1024 * 1024)
@@ -958,7 +967,11 @@ def download_artifact_archive(
         f"https://{pod_id}-8000.proxy.runpod.net/artifacts.tar.gz?"
         + urllib.parse.urlencode({"token": stream_token})
     )
-    request = urllib.request.Request(url, method="GET")
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": PROXY_USER_AGENT},
+        method="GET",
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     digest = hashlib.sha256()

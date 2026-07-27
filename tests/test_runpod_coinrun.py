@@ -247,6 +247,7 @@ class CredentialAndHTTPTests(unittest.TestCase):
         def opener(request, timeout):
             seen["url"] = request.full_url
             seen["authorization"] = request.get_header("Authorization")
+            seen["user_agent"] = request.get_header("User-agent")
             return FakeResponse(b"line\n", {"X-Next-Offset": "5"})
 
         result = runpod_coinrun.fetch_log_chunk(
@@ -255,6 +256,10 @@ class CredentialAndHTTPTests(unittest.TestCase):
 
         self.assertEqual(result, (b"line\n", 5))
         self.assertIsNone(seen["authorization"])
+        self.assertEqual(
+            seen["user_agent"],
+            runpod_coinrun.PROXY_USER_AGENT,
+        )
         parsed = urllib.parse.urlparse(seen["url"])
         self.assertEqual(parsed.path, "/log")
         self.assertEqual(

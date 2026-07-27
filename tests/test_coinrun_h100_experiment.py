@@ -65,6 +65,8 @@ class CoinRunH100ExperimentScriptTests(unittest.TestCase):
             self.assertIn("collector_records_seen", script_text)
             self.assertIn("collector_records_selected", script_text)
             self.assertIn('("random", "scripted")', script_text)
+            self.assertIn("'H100|H200|B200'", script_text)
+            self.assertNotIn("rg -", script_text)
 
     def test_dry_run_fallback_renders_one_smaller_preset(self):
         with tempfile.TemporaryDirectory() as directory:

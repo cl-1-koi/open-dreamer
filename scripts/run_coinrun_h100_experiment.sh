@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Bounded, local-only CoinRun H100 experiment controller. It deliberately has
-# no RunPod API dependency; launch it only from an already-provisioned H100.
+# Bounded, local-only CoinRun high-memory GPU experiment controller. It
+# deliberately has no RunPod API dependency; launch it only from an
+# already-provisioned H100, H200, or B200.
 set -Eeuo pipefail
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,7 +22,8 @@ usage() {
   cat <<'EOF'
 Usage: COINRUN_ARTIFACT_DIR=/absolute/path scripts/run_coinrun_h100_experiment.sh [options]
 
-Runs a bounded, local H100 CoinRun experiment. It never creates or manages a pod.
+Runs a bounded local CoinRun experiment on an H100, H200, or B200. It never
+creates or manages a pod.
 
 Options:
   --artifact-dir PATH  Override COINRUN_ARTIFACT_DIR.
@@ -246,7 +248,7 @@ select_preset() {
 
 is_oom_failure() {
   local log="$1"
-  rg -qi 'out of memory|RESOURCE_EXHAUSTED|CUDA_ERROR_OUT_OF_MEMORY|oom-kill' "$log"
+  grep -Eqi 'out of memory|RESOURCE_EXHAUSTED|CUDA_ERROR_OUT_OF_MEMORY|oom-kill' "$log"
 }
 
 capture_config() {
@@ -304,7 +306,7 @@ build_dynamics_overrides() {
 
 check_checkpoint_gate() {
   local stage="$1" directory="$2" count
-  count="$(find "$directory" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | rg -c '^[0-9]+$' || true)"
+  count="$(find "$directory" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -Ec '^[0-9]+$' || true)"
   [[ "$count" =~ ^[0-9]+$ ]] || count=0
   ((count >= 2)) || { FINAL_ERROR="$stage checkpoint gate failed: expected at least two saved checkpoints in $directory"; return 1; }
   mkdir -p "$ARTIFACT_DIR/gates"
@@ -406,8 +408,9 @@ fi
 
 command -v uv >/dev/null 2>&1 || die "uv is required"
 command -v timeout >/dev/null 2>&1 || die "GNU timeout is required"
-command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required for this H100-only pipeline"
-nvidia-smi --query-gpu=name --format=csv,noheader | rg -qi 'H100' || die "an NVIDIA H100 is required"
+command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required for this GPU pipeline"
+nvidia-smi --query-gpu=name --format=csv,noheader | grep -Eqi 'H100|H200|B200' \
+  || die "an NVIDIA H100, H200, or B200 is required"
 
 generator="$REPO_ROOT/dreamer/data/generate_coinrun_dataset.py"
 episodes_train="${COINRUN_EPISODES_TRAIN_PER_COLLECTOR:-400}"
