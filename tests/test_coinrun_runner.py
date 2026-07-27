@@ -263,8 +263,10 @@ class SmokeCommandTests(unittest.TestCase):
         command = runner.dataset_command(
             Path("/workspace/open-dreamer"), "scripted", Path("/tmp/out"), 7
         )
-        self.assertEqual(command[:5], ["uv", "run", "--isolated", "--script",
-                                       "/workspace/open-dreamer/dreamer/data/generate_coinrun_dataset.py"])
+        self.assertEqual(command[:2], [
+            "coinrun-dataset-python",
+            "/workspace/open-dreamer/dreamer/data/generate_coinrun_dataset.py",
+        ])
         self.assertIn("--collector=scripted", command)
         self.assertIn("--seed=7", command)
         self.assertIn(f"--num-episodes-train={runner.SMOKE_EPISODES}", command)

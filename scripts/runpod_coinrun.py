@@ -1469,8 +1469,13 @@ test -x "$target/venv/bin/python" || { echo "venv python missing" >&2; exit 14; 
 test -x "$target/bin/uv" || { echo "bundle uv missing" >&2; exit 15; }
 ln -sfn "$target/bin/uv" /usr/local/bin/uv
 "$target/bin/uv" --version
-"$target/venv/bin/python" -c 'import jax, flax, optax'   || { echo "venv imports failed" >&2; exit 16; }
-test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "Procgen libenv.so missing from the uv cache" >&2; exit 17; }
+dataset_python="$(find "$target/uv-cache/environments-v2" -mindepth 3 -maxdepth 3 \
+  -path '*/bin/python' -type l -print -quit)"
+test -n "$dataset_python" && test -x "$dataset_python" \
+  || { echo "prewarmed CoinRun dataset Python missing" >&2; exit 16; }
+ln -sfn "$dataset_python" /usr/local/bin/coinrun-dataset-python
+"$target/venv/bin/python" -c 'import jax, flax, optax'   || { echo "venv imports failed" >&2; exit 17; }
+test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "Procgen libenv.so missing from the uv cache" >&2; exit 18; }
 # The image builds /usr/local/bin/coinrun-runner outside /opt/coinrun, so the
 # bundle cannot carry it. Recreate it -- but pointing at the pinned runtime
 # checkout, never at the copy inside the archive. The bundle is a dependency
@@ -1486,12 +1491,13 @@ printf '#!/bin/sh\nexec %s/venv/bin/python "${COINRUN_CHECKOUT_ROOT:-/workspace/
 # is present on disk but invisible, and JAX silently falls back to CPU.
 python_lib="$target/venv/lib/python3.11/site-packages"
 nvidia_libs="$(find "$python_lib/nvidia" -type d -name lib -print 2>/dev/null | sort | paste -sd: -)"
-test -s "$target/runtime-libs/libQt5Gui.so.5" || { echo "Procgen runtime libraries missing" >&2; exit 18; }
+test -s "$target/runtime-libs/libQt5Gui.so.5" || { echo "Procgen runtime libraries missing" >&2; exit 19; }
 runtime_libs="$target/runtime-libs${nvidia_libs:+:$nvidia_libs}"
 sed -i "2i export LD_LIBRARY_PATH=$runtime_libs\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" \
   /usr/local/bin/coinrun-runner
 chmod 0755 /usr/local/bin/coinrun-runner
-command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 19; }
+command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 20; }
+command -v coinrun-dataset-python >/dev/null || { echo "dataset Python shim missing" >&2; exit 21; }
 
 echo "bundle verified and installed at $target"
 """

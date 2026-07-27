@@ -29,7 +29,9 @@ from typing import Any, Sequence
 IMAGE_CONTRACT = "1"
 SMOKE_BUDGET_SECONDS = 300
 SUPPORTED_GPUS = ("H100", "H200", "B200")
-REQUIRED_BINARIES = ("git", "uv", "timeout", "grep", "ffmpeg", "nvidia-smi")
+REQUIRED_BINARIES = (
+    "git", "uv", "coinrun-dataset-python", "timeout", "grep", "ffmpeg", "nvidia-smi"
+)
 REQUIRED_IMPORTS = ("jax", "flax", "optax", "grain", "hydra", "imageio", "array_record")
 # Two episodes per split proves the Procgen toolchain and record round-trip.
 # Dataset scale for real runs lives in the experiment controller.
@@ -155,9 +157,9 @@ def check_gpu(checkout: Path, env: dict[str, str]) -> dict[str, Any]:
 
 
 def dataset_command(checkout: Path, collector: str, out: Path, seed: int) -> list[str]:
-    """Same invocation shape the experiment controller uses, at smoke scale."""
+    """Use the prewarmed script environment without resolving at pod runtime."""
     return [
-        "uv", "run", "--isolated", "--script",
+        "coinrun-dataset-python",
         str(checkout / "dreamer" / "data" / "generate_coinrun_dataset.py"),
         f"--collector={collector}", f"--output-dir={out}", f"--seed={seed}",
         f"--num-episodes-train={SMOKE_EPISODES}",

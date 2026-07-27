@@ -392,7 +392,7 @@ select_preset "$requested_preset"
 if ((dry_run)); then
   build_tokenizer_overrides "$ARTIFACT_DIR/tokenizer_initial"
   record_command tokenizer_train_initial uv run python "$REPO_ROOT/scripts/train_tokenizer.py" --config-name=coinrun_tokenizer "${tokenizer_overrides[@]}"
-  printf '%s\n' "uv run --isolated --script $REPO_ROOT/dreamer/data/generate_coinrun_dataset.py --collector=random|scripted --output-dir=$ARTIFACT_DIR/dataset_sources/<collector>" > "$COMMAND_DIR/collection.command"
+  printf '%s\n' "coinrun-dataset-python $REPO_ROOT/dreamer/data/generate_coinrun_dataset.py --collector=random|scripted --output-dir=$ARTIFACT_DIR/dataset_sources/<collector>" > "$COMMAND_DIR/collection.command"
   dry_probe="$ARTIFACT_DIR/dry_run_latent_stats.json"
   python3 - "$dry_probe" "$tokenizer_bottleneck" <<'PY'
 import json
@@ -410,6 +410,7 @@ PY
 fi
 
 command -v uv >/dev/null 2>&1 || die "uv is required"
+command -v coinrun-dataset-python >/dev/null 2>&1 || die "prewarmed dataset Python is required"
 command -v timeout >/dev/null 2>&1 || die "GNU timeout is required"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required for this GPU pipeline"
 nvidia-smi --query-gpu=name --format=csv,noheader | grep -Eqi 'H100|H200|B200' \
@@ -421,11 +422,11 @@ episodes_val="${COINRUN_EPISODES_VAL_PER_COLLECTOR:-32}"
 episodes_test="${COINRUN_EPISODES_TEST_PER_COLLECTOR:-32}"
 for count in "$episodes_train" "$episodes_val" "$episodes_test"; do [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "episode counts must be positive integers"; done
 
-run_phase collect_random "$DEFAULT_COLLECTION_SECONDS" uv run --isolated --script "$generator" \
+run_phase collect_random "$DEFAULT_COLLECTION_SECONDS" coinrun-dataset-python "$generator" \
   "--num-episodes-train=$episodes_train" "--num-episodes-val=$episodes_val" "--num-episodes-test=$episodes_test" \
   "--output-dir=$ARTIFACT_DIR/dataset_sources/random" --min-episode-length=64 --max-episode-length=256 \
   --chunk-size=256 --chunks-per-file=32 --collector=random --keep-short-terminated "--seed=$seed" --overwrite || exit $?
-run_phase collect_scripted "$DEFAULT_COLLECTION_SECONDS" uv run --isolated --script "$generator" \
+run_phase collect_scripted "$DEFAULT_COLLECTION_SECONDS" coinrun-dataset-python "$generator" \
   "--num-episodes-train=$episodes_train" "--num-episodes-val=$episodes_val" "--num-episodes-test=$episodes_test" \
   "--output-dir=$ARTIFACT_DIR/dataset_sources/scripted" --min-episode-length=64 --max-episode-length=256 \
   --chunk-size=256 --chunks-per-file=32 --collector=scripted --keep-short-terminated "--seed=$((seed + 1))" --overwrite || exit $?

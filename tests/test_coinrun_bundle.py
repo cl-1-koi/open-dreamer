@@ -413,6 +413,11 @@ class BundleShimTests(unittest.TestCase):
         self.assertIn('ln -sfn "$target/bin/uv" /usr/local/bin/uv', script)
         self.assertIn('"$target/bin/uv" --version', script)
 
+    def test_remote_setup_exposes_the_prebuilt_dataset_environment_directly(self):
+        script = rc.REMOTE_BUNDLE_SETUP
+        self.assertIn('dataset_python="$(find "$target/uv-cache/environments-v2"', script)
+        self.assertIn("/usr/local/bin/coinrun-dataset-python", script)
+
     def test_remote_setup_adds_procgen_and_nvidia_libraries_to_the_loader_path(self):
         script = rc.REMOTE_BUNDLE_SETUP
         self.assertIn('$target/runtime-libs/libQt5Gui.so.5', script)

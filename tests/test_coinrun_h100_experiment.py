@@ -27,7 +27,7 @@ class CoinRunH100ExperimentScriptTests(unittest.TestCase):
             check=False,
         )
 
-    def test_dry_run_builds_local_isolated_commands_and_manifest(self):
+    def test_dry_run_builds_prewarmed_collection_commands_and_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact_dir = Path(directory) / "artifacts"
             result = self.run_script(
@@ -48,7 +48,8 @@ class CoinRunH100ExperimentScriptTests(unittest.TestCase):
             self.assertNotIn("runpod", tokenizer.lower())
 
             collection = (artifact_dir / "commands" / "collection.command").read_text()
-            self.assertIn("--isolated", collection)
+            self.assertIn("coinrun-dataset-python", collection)
+            self.assertNotIn("uv run --isolated", collection)
             self.assertIn("--collector=random|scripted", collection)
 
             dynamics = (artifact_dir / "commands" / "dynamics_train_initial.command").read_text()
