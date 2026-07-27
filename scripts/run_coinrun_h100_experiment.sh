@@ -448,6 +448,18 @@ command -v timeout >/dev/null 2>&1 || die "GNU timeout is required"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required for this GPU pipeline"
 nvidia-smi --query-gpu=name --format=csv,noheader | grep -Eqi 'H100|H200|B200' \
   || die "an NVIDIA H100, H200, or B200 is required"
+run_phase jax_gpu_preflight 180 uv run python -c '
+import json
+import jax
+import jax.numpy as jnp
+
+devices = [device for device in jax.devices() if device.platform == "gpu"]
+if len(devices) != 1:
+    raise SystemExit(f"expected exactly one JAX GPU, got {jax.devices()}")
+probe = (jnp.ones((16, 16), dtype=jnp.float32) @ jnp.ones((16, 16), dtype=jnp.float32))
+probe.block_until_ready()
+print(json.dumps({"device": devices[0].device_kind, "platform": devices[0].platform}))
+' || exit $?
 
 generator="$REPO_ROOT/dreamer/data/generate_coinrun_dataset.py"
 episodes_train="${COINRUN_EPISODES_TRAIN_PER_COLLECTOR:-400}"

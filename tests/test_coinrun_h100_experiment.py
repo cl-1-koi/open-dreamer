@@ -86,6 +86,17 @@ class CoinRunH100ExperimentScriptTests(unittest.TestCase):
             script_text,
         )
 
+    def test_paid_work_requires_a_live_jax_gpu_probe(self):
+        script_text = SCRIPT.read_text()
+
+        self.assertIn("run_phase jax_gpu_preflight 180 uv run python", script_text)
+        self.assertIn('device.platform == "gpu"', script_text)
+        self.assertIn("probe.block_until_ready()", script_text)
+        self.assertLess(
+            script_text.index("run_phase jax_gpu_preflight"),
+            script_text.index("run_phase resume_input"),
+        )
+
     def test_rejects_invalid_phase_timeout_before_writing_commands(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact_dir = Path(directory) / "artifacts"
