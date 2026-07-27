@@ -1466,8 +1466,11 @@ mv "$target.incoming/coinrun" "$target"
 rm -rf "$target.incoming" "$target.old"
 
 test -x "$target/venv/bin/python" || { echo "venv python missing" >&2; exit 14; }
-"$target/venv/bin/python" -c 'import jax, flax, optax'   || { echo "venv imports failed" >&2; exit 15; }
-test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "Procgen libenv.so missing from the uv cache" >&2; exit 16; }
+test -x "$target/bin/uv" || { echo "bundle uv missing" >&2; exit 15; }
+ln -sfn "$target/bin/uv" /usr/local/bin/uv
+"$target/bin/uv" --version
+"$target/venv/bin/python" -c 'import jax, flax, optax'   || { echo "venv imports failed" >&2; exit 16; }
+test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "Procgen libenv.so missing from the uv cache" >&2; exit 17; }
 # The image builds /usr/local/bin/coinrun-runner outside /opt/coinrun, so the
 # bundle cannot carry it. Recreate it -- but pointing at the pinned runtime
 # checkout, never at the copy inside the archive. The bundle is a dependency
@@ -1488,7 +1491,7 @@ if [ -n "$nvidia_libs" ]; then
     /usr/local/bin/coinrun-runner
 fi
 chmod 0755 /usr/local/bin/coinrun-runner
-command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 17; }
+command -v coinrun-runner >/dev/null || { echo "coinrun-runner shim missing" >&2; exit 18; }
 
 echo "bundle verified and installed at $target"
 """

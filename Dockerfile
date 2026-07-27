@@ -104,12 +104,17 @@ RUN uv run --isolated --script ./generate_coinrun_dataset.py \
     && test -n "$(find /opt/coinrun/uv-cache -name libenv.so -print -quit)" \
     && rm -rf /tmp/procgen-warmup ./generate_coinrun_dataset.py
 
-# Drop the build scratch dir. No `uv cache prune` here on purpose: with the
-# sync's downloads confined to the cache mount above, /opt/coinrun/uv-cache now
-# holds only what the offline Procgen smoke needs -- the source-built Procgen
-# wheel plus the isolated script's own wheels (gym3, numpy<2, tyro). Pruning
-# would delete the latter and force a network install on the pod.
-RUN rm -rf /opt/coinrun/build \
+# Drop the build scratch dir. Keep the exact uv binary beside the cache it
+# created: the RunPod base image may carry an older uv which cannot consume a
+# newer cache format. No `uv cache prune` here on purpose: with the sync's
+# downloads confined to the cache mount above, /opt/coinrun/uv-cache now holds
+# only what the offline Procgen smoke needs -- the source-built Procgen wheel
+# plus the isolated script's own wheels (gym3, numpy<2, tyro). Pruning would
+# delete the latter and force a network install on the pod.
+RUN mkdir -p /opt/coinrun/bin \
+    && cp /usr/local/bin/uv /opt/coinrun/bin/uv \
+    && rm -rf /opt/coinrun/build \
+    && test -x /opt/coinrun/bin/uv \
     && test -n "$(find /opt/coinrun/uv-cache -name libenv.so -print -quit)"
 
 

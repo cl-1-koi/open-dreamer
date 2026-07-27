@@ -407,6 +407,12 @@ class ProvenanceVersusCompatibilityTests(unittest.TestCase):
 
 
 class BundleShimTests(unittest.TestCase):
+    def test_remote_setup_selects_the_uv_binary_bundled_with_its_cache(self):
+        script = rc.REMOTE_BUNDLE_SETUP
+        self.assertIn('test -x "$target/bin/uv"', script)
+        self.assertIn('ln -sfn "$target/bin/uv" /usr/local/bin/uv', script)
+        self.assertIn('"$target/bin/uv" --version', script)
+
     def test_remote_setup_recreates_the_runner_shim(self):
         # /usr/local/bin/coinrun-runner is built outside /opt/coinrun, so the
         # bundle cannot carry it; setup must recreate it or the documented

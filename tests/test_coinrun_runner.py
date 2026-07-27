@@ -132,6 +132,10 @@ class DockerfileContractTests(unittest.TestCase):
     def test_runtime_forces_uv_to_use_the_prebuilt_cache_offline(self):
         self.assertIn("UV_OFFLINE=1", self.text)
 
+    def test_bundle_tree_carries_the_uv_binary_that_created_its_cache(self):
+        self.assertIn("cp /usr/local/bin/uv /opt/coinrun/bin/uv", self.text)
+        self.assertIn("test -x /opt/coinrun/bin/uv", self.text)
+
     def test_build_fails_when_lock_hash_arg_does_not_match_copied_lock(self):
         self.assertIn('test "$(sha256sum uv.lock | cut -d\' \' -f1)" = "${UV_LOCK_SHA256}"', self.text)
 
