@@ -6,14 +6,15 @@ set -Eeuo pipefail
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly MAX_TOTAL_SECONDS=13500 # 3h45m hard maximum, including finalization.
-readonly DEFAULT_COLLECTION_SECONDS=1600
-readonly DEFAULT_CONFIG_SECONDS=240
-readonly DEFAULT_TOKENIZER_SECONDS=4800
-readonly DEFAULT_PROBE_SECONDS=600
-readonly DEFAULT_DYNAMICS_SECONDS=4800
-readonly DEFAULT_EVAL_SECONDS=600
+readonly DEFAULT_COLLECTION_SECONDS="${COINRUN_COLLECTION_SECONDS:-1600}"
+readonly DEFAULT_CONFIG_SECONDS="${COINRUN_CONFIG_SECONDS:-240}"
+readonly DEFAULT_TOKENIZER_SECONDS="${COINRUN_TOKENIZER_SECONDS:-4800}"
+readonly DEFAULT_PROBE_SECONDS="${COINRUN_PROBE_SECONDS:-600}"
+readonly DEFAULT_DYNAMICS_SECONDS="${COINRUN_DYNAMICS_SECONDS:-4800}"
+readonly DEFAULT_EVAL_SECONDS="${COINRUN_EVAL_SECONDS:-600}"
 
 artifact_dir="${COINRUN_ARTIFACT_DIR:-}"
+resume_input_dir="${COINRUN_RESUME_INPUT_DIR:-}"
 dry_run=0
 requested_preset="initial"
 seed="${COINRUN_SEED:-20260726}"
@@ -71,8 +72,15 @@ done
 
 [[ -n "$artifact_dir" ]] || die "COINRUN_ARTIFACT_DIR or --artifact-dir is required"
 [[ "$artifact_dir" = /* ]] || die "artifact directory must be an absolute path"
+[[ -z "$resume_input_dir" || "$resume_input_dir" = /* ]] || die "COINRUN_RESUME_INPUT_DIR must be absolute"
 [[ "$seed" =~ ^[0-9]+$ ]] || die "seed must be a non-negative integer"
 [[ "$requested_preset" == "initial" || "$requested_preset" == "fallback" ]] || die "preset must be initial or fallback"
+for phase_seconds in \
+  "$DEFAULT_COLLECTION_SECONDS" "$DEFAULT_CONFIG_SECONDS" \
+  "$DEFAULT_TOKENIZER_SECONDS" "$DEFAULT_PROBE_SECONDS" \
+  "$DEFAULT_DYNAMICS_SECONDS" "$DEFAULT_EVAL_SECONDS"; do
+  [[ "$phase_seconds" =~ ^[1-9][0-9]*$ ]] || die "phase timeout overrides must be positive integers"
+done
 
 ARTIFACT_DIR="${artifact_dir%/}"
 COMMAND_DIR="$ARTIFACT_DIR/commands"
@@ -103,6 +111,7 @@ write_manifest() {
   local error="${2:-}"
   export ARTIFACT_DIR MANIFEST_PATH PHASE_TIMINGS START_EPOCH DEADLINE_EPOCH MAX_TOTAL_SECONDS
   export FINAL_STATUS="$status" FINAL_ERROR="$error" ACTIVE_PRESET FALLBACK_USED CURRENT_PHASE
+  export RESUME_INPUT_DIR="$resume_input_dir"
   python3 - <<'PY'
 import json
 import os
@@ -137,6 +146,7 @@ manifest = {
     "deadline_epoch": int(os.environ["DEADLINE_EPOCH"]),
     "active_preset": os.environ["ACTIVE_PRESET"],
     "oom_fallback_used": os.environ["FALLBACK_USED"] == "true",
+    "resume_input_dir": os.environ["RESUME_INPUT_DIR"] or None,
     "git": {
         "commit": text(root / "git" / "commit.txt"),
         "branch": text(root / "git" / "branch.txt"),
@@ -380,6 +390,29 @@ print(json.dumps({"stats": stats, "gates": gates}, indent=2, sort_keys=True))
 PY
 }
 
+stage_resume_input() {
+  local source="$RESUME_INPUT_DIR"
+  [[ -d "$source/dataset/train" && -d "$source/dataset/val" && -d "$source/dataset/test" ]] \
+    || { printf 'resume input is missing train/val/test dataset directories: %s\n' "$source" >&2; return 1; }
+  [[ -s "$source/dataset/metadata.json" ]] \
+    || { printf 'resume input is missing dataset metadata: %s\n' "$source" >&2; return 1; }
+  [[ -d "$source/tokenizer_initial/checkpoints" ]] \
+    || { printf 'resume input is missing tokenizer checkpoints: %s\n' "$source" >&2; return 1; }
+  local checkpoint_count
+  checkpoint_count="$(
+    find "$source/tokenizer_initial/checkpoints" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+      | grep -Ec '^[0-9]+$' || true
+  )"
+  ((checkpoint_count >= 1)) \
+    || { printf 'resume input contains no numbered tokenizer checkpoint\n' >&2; return 1; }
+
+  cp -a --reflink=auto "$source/dataset" "$ARTIFACT_DIR/dataset"
+  mkdir -p "$ARTIFACT_DIR/tokenizer_initial"
+  cp -a --reflink=auto \
+    "$source/tokenizer_initial/checkpoints" \
+    "$ARTIFACT_DIR/tokenizer_initial/checkpoints"
+}
+
 START_EPOCH="$(date +%s)"
 DEADLINE_EPOCH="$((START_EPOCH + MAX_TOTAL_SECONDS))"
 printf 'name\tstarted_epoch\telapsed_seconds\treturncode\tdeadline_seconds\n' > "$PHASE_TIMINGS"
@@ -422,19 +455,26 @@ episodes_val="${COINRUN_EPISODES_VAL_PER_COLLECTOR:-32}"
 episodes_test="${COINRUN_EPISODES_TEST_PER_COLLECTOR:-32}"
 for count in "$episodes_train" "$episodes_val" "$episodes_test"; do [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "episode counts must be positive integers"; done
 
-run_phase collect_random "$DEFAULT_COLLECTION_SECONDS" coinrun-dataset-python "$generator" \
-  "--num-episodes-train=$episodes_train" "--num-episodes-val=$episodes_val" "--num-episodes-test=$episodes_test" \
-  "--output-dir=$ARTIFACT_DIR/dataset_sources/random" --min-episode-length=64 --max-episode-length=256 \
-  --chunk-size=256 --chunks-per-file=32 --collector=random --keep-short-terminated "--seed=$seed" --overwrite || exit $?
-run_phase collect_scripted "$DEFAULT_COLLECTION_SECONDS" coinrun-dataset-python "$generator" \
-  "--num-episodes-train=$episodes_train" "--num-episodes-val=$episodes_val" "--num-episodes-test=$episodes_test" \
-  "--output-dir=$ARTIFACT_DIR/dataset_sources/scripted" --min-episode-length=64 --max-episode-length=256 \
-  --chunk-size=256 --chunks-per-file=32 --collector=scripted --keep-short-terminated "--seed=$((seed + 1))" --overwrite || exit $?
 export DATASET_DIR REPO_ROOT ARTIFACT_DIR
-run_phase dataset_merge 120 bash -c "$(declare -f merge_mixed_dataset); merge_mixed_dataset" || exit $?
+if [[ -n "$resume_input_dir" ]]; then
+  export RESUME_INPUT_DIR="$resume_input_dir"
+  run_phase resume_input 900 bash -c "$(declare -f stage_resume_input); stage_resume_input" || exit $?
+  printf 'passed: copied resume dataset and tokenizer checkpoint input\n' \
+    > "$ARTIFACT_DIR/gates/resume_input.txt"
+else
+  run_phase collect_random "$DEFAULT_COLLECTION_SECONDS" coinrun-dataset-python "$generator" \
+    "--num-episodes-train=$episodes_train" "--num-episodes-val=$episodes_val" "--num-episodes-test=$episodes_test" \
+    "--output-dir=$ARTIFACT_DIR/dataset_sources/random" --min-episode-length=64 --max-episode-length=256 \
+    --chunk-size=256 --chunks-per-file=32 --collector=random --keep-short-terminated "--seed=$seed" --overwrite || exit $?
+  run_phase collect_scripted "$DEFAULT_COLLECTION_SECONDS" coinrun-dataset-python "$generator" \
+    "--num-episodes-train=$episodes_train" "--num-episodes-val=$episodes_val" "--num-episodes-test=$episodes_test" \
+    "--output-dir=$ARTIFACT_DIR/dataset_sources/scripted" --min-episode-length=64 --max-episode-length=256 \
+    --chunk-size=256 --chunks-per-file=32 --collector=scripted --keep-short-terminated "--seed=$((seed + 1))" --overwrite || exit $?
+  run_phase dataset_merge 120 bash -c "$(declare -f merge_mixed_dataset); merge_mixed_dataset" || exit $?
+fi
 run_phase dataset_validation 300 bash -c "$(declare -f validate_dataset); validate_dataset" > /dev/null || exit $?
 cp "$LOG_DIR/dataset_validation.log" "$ARTIFACT_DIR/dataset_validation.json"
-printf 'passed: isolated Procgen random+scripted corpus with disjoint split seed ranges\n' > "$ARTIFACT_DIR/gates/dataset.txt"
+printf 'passed: validated Procgen random+scripted corpus with disjoint split seed ranges\n' > "$ARTIFACT_DIR/gates/dataset.txt"
 
 run_tokenizer() {
   local preset="$1"

@@ -39,6 +39,7 @@ class CoinRunH100ExperimentScriptTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "dry_run")
             self.assertEqual(manifest["hard_total_deadline_seconds"], 13500)
             self.assertFalse(manifest["oom_fallback_used"])
+            self.assertIsNone(manifest["resume_input_dir"])
 
             tokenizer = (artifact_dir / "commands" / "tokenizer_train_initial.command").read_text()
             self.assertIn("train_tokenizer.py", tokenizer)
@@ -68,6 +69,35 @@ class CoinRunH100ExperimentScriptTests(unittest.TestCase):
             self.assertIn('("random", "scripted")', script_text)
             self.assertIn("'H100|H200|B200'", script_text)
             self.assertNotIn("rg -", script_text)
+
+    def test_resume_mode_is_explicit_and_phase_timeouts_are_overridable(self):
+        script_text = SCRIPT.read_text()
+
+        self.assertIn('resume_input_dir="${COINRUN_RESUME_INPUT_DIR:-}"', script_text)
+        self.assertIn("stage_resume_input()", script_text)
+        self.assertIn('"$source/tokenizer_initial/checkpoints"', script_text)
+        self.assertIn('if [[ -n "$resume_input_dir" ]]', script_text)
+        self.assertIn(
+            'DEFAULT_TOKENIZER_SECONDS="${COINRUN_TOKENIZER_SECONDS:-4800}"',
+            script_text,
+        )
+        self.assertIn(
+            'DEFAULT_DYNAMICS_SECONDS="${COINRUN_DYNAMICS_SECONDS:-4800}"',
+            script_text,
+        )
+
+    def test_rejects_invalid_phase_timeout_before_writing_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_dir = Path(directory) / "artifacts"
+            result = self.run_script(
+                "--dry-run",
+                "--artifact-dir",
+                str(artifact_dir),
+                env={"COINRUN_TOKENIZER_SECONDS": "0"},
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("phase timeout overrides", result.stderr)
 
     def test_dry_run_fallback_renders_one_smaller_preset(self):
         with tempfile.TemporaryDirectory() as directory:
