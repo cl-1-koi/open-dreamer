@@ -391,13 +391,17 @@ class ImmutableImageSelectionTests(unittest.TestCase):
                 with self.assertRaises(runpod_coinrun.DeploymentError):
                     runpod_coinrun.validate_image_reference(reference)
 
-    def test_launch_requires_an_explicit_image(self):
-        parser = runpod_coinrun.build_parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args([
-                "launch", "--preflight-report", "r.json", "--gpu", "H200",
-                "--experiment-command", "true",
-            ])
+    def test_image_transport_requires_an_explicit_image(self):
+        # argparse no longer requires --image (bundle mode must not take one),
+        # so the requirement is enforced by the validation gate instead.
+        args = runpod_coinrun.build_parser().parse_args([
+            "launch", "--preflight-report", "r.json", "--gpu", "H200",
+            "--experiment-command", "true",
+        ])
+        self.assertEqual(args.transport, "image")
+        with self.assertRaises(runpod_coinrun.DeploymentError) as caught:
+            runpod_coinrun.validate_cli_args(args)
+        self.assertIn("--image is required", str(caught.exception))
 
 
 class RemoteBootstrapTests(unittest.TestCase):

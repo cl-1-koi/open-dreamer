@@ -1,0 +1,49 @@
+{
+  "archive": {
+    "bytes": 3000764892,
+    "compression": "zstd",
+    "compression_level": 9,
+    "filename": "coinrun-opt-195069f66bce.tar.zst",
+    "sha256": "b77b3bb05b6ecb6c1a5a70344b2f08b091fb20b3c57392a6e48ed10690d7d3c2",
+    "uncompressed_bytes": 6911641600,
+    "uncompressed_tar_sha256": "eb7d08479c69404794ed14641640ab56ec446896639aeaa4a87cb0b9d7b0a928"
+  },
+  "base_image": {
+    "digest": "sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f",
+    "reference": "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"
+  },
+  "build": {
+    "command": "docker run --rm --entrypoint tar 8785f6fe9a2f --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu -C /opt -cf - coinrun",
+    "determinism": "tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner; payload still contains absolute paths and bytecode, so reconstruction is semantic, not bit-exact",
+    "tool_versions": {
+      "docker": "Docker version 28.5.1, build e180ab8",
+      "tar": "tar (GNU tar) 1.34",
+      "zstd": "*** zstd command line interface 64-bits v1.4.8, by Yann Collet ***"
+    }
+  },
+  "contract_env": {
+    "COINRUN_IMAGE_CONTRACT": "1",
+    "COINRUN_SOURCE_COMMIT": "195069f66bce8f8f262a7b17ba16d193b25961d5",
+    "COINRUN_UV_LOCK_SHA256": "795e24f0e9b1ec29a41064721afd40910af73ff0233f4c4114eecd773281f066",
+    "UV_CACHE_DIR": "/opt/coinrun/uv-cache",
+    "UV_COMPILE_BYTECODE": "1",
+    "UV_LINK_MODE": "copy",
+    "UV_PROJECT_ENVIRONMENT": "/opt/coinrun/venv",
+    "UV_PYTHON_DOWNLOADS": "never",
+    "UV_PYTHON_INSTALL_DIR": "/opt/coinrun/python"
+  },
+  "created_utc": "2026-07-27T04:08:31.068959Z",
+  "extract": {
+    "expected_top_level": "coinrun",
+    "parent": "/opt",
+    "target": "/opt/coinrun"
+  },
+  "schema": "coinrun-runner-bundle-v1",
+  "source": {
+    "commit": "195069f66bce8f8f262a7b17ba16d193b25961d5",
+    "dockerfile_sha256": "b60c71f5367ae97922871c925b4ea54741cf90ca5f0f7349b745b34e11c92871",
+    "image_id": "sha256:8785f6fe9a2f598101186a8b45f72b80e313b640fd0a2e2efbbaf0ed22335ff0",
+    "image_reference": "8785f6fe9a2f",
+    "uv_lock_sha256": "795e24f0e9b1ec29a41064721afd40910af73ff0233f4c4114eecd773281f066"
+  }
+}

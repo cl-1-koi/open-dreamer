@@ -762,6 +762,7 @@ def build_remote_script(
     artifact_dir: str,
     stream_token: str,
     deadline_epoch: int,
+    contract_env: dict[str, str] | None = None,
 ) -> str:
     if not 0 < runtime_seconds <= MAX_RUNTIME_SECONDS:
         raise DeploymentError("Remote runtime must be in (0, 14400] seconds")
@@ -779,6 +780,14 @@ def build_remote_script(
         raise DeploymentError("Remote stream token is invalid")
     if deadline_epoch <= 0:
         raise DeploymentError("Remote watchdog deadline is invalid")
+
+    # In bundle mode the contract variables come from the manifest instead of
+    # image ENV. Emit them before anything reads them.
+    exports = ""
+    for key, value in sorted((contract_env or {}).items()):
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or "\n" in str(value):
+            raise DeploymentError(f"invalid contract env entry: {key!r}")
+        exports += f"export {key}={shlex.quote(str(value))}\n"
 
     helper_sources = {
         "self_terminate_b64": base64.b64encode(
@@ -800,6 +809,7 @@ def build_remote_script(
         "artifact_dir": shlex.quote(artifact_dir),
         "stream_token": shlex.quote(stream_token),
         "deadline_epoch": deadline_epoch,
+        "contract_exports": textwrap.indent(exports, " " * 8),
         **helper_sources,
     }
     return textwrap.dedent(
@@ -811,10 +821,17 @@ def build_remote_script(
         export COINRUN_COMMIT_SHA=%(commit)s
         export COINRUN_BRANCH=%(branch)s
         export COINRUN_STREAM_TOKEN=%(stream_token)s
-        HARD_DEADLINE_EPOCH=%(deadline_epoch)d
+%(contract_exports)sHARD_DEADLINE_EPOCH=%(deadline_epoch)d
         watchdog_delay=$((HARD_DEADLINE_EPOCH - $(date +%%s)))
         if [ "$watchdog_delay" -lt 0 ]; then watchdog_delay=0; fi
-        experiment_timeout=$((watchdog_delay - %(finalization_seconds)d))
+        # The experiment gets exactly --runtime-seconds. Unused setup budget must
+        # not silently extend training; the absolute watchdog above still bounds
+        # setup + experiment + finalization.
+        experiment_timeout=%(runtime)d
+        deadline_room=$((watchdog_delay - %(finalization_seconds)d))
+        if [ "$experiment_timeout" -gt "$deadline_room" ]; then
+          experiment_timeout="$deadline_room"
+        fi
         if [ "$experiment_timeout" -lt 1 ]; then experiment_timeout=1; fi
         REPO_DIR=/workspace/open-dreamer
         mkdir -p "$COINRUN_STREAM_DIR" "$COINRUN_ARTIFACT_DIR"
@@ -893,6 +910,537 @@ def encode_start_command(remote_script: str) -> str:
         f"printf %s {shlex.quote(encoded)} | base64 -d "
         "> /tmp/run_coinrun.sh && exec bash /tmp/run_coinrun.sh"
     )
+
+
+# ---------------------------------------------------------------------------
+# Direct-bundle transport
+#
+# Instead of publishing a 26.5 GB image, the pod boots the pinned RunPod
+# PyTorch base and receives only /opt/coinrun (~3.0 GB compressed) over SSH.
+# The checked-in manifest is the contract; everything below fails closed before
+# any paid mutation.
+# ---------------------------------------------------------------------------
+
+BUNDLE_SCHEMA = "coinrun-runner-bundle-v1"
+DEFAULT_BUNDLE_MANIFEST = (
+    Path(__file__).resolve().parents[1] / "manifests" / "coinrun_runner_bundle.json"
+)
+DEFAULT_BUNDLE_DIR = (
+    Path(__file__).resolve().parents[1] / "artifacts" / "coinrun_bundle"
+)
+DEFAULT_SETUP_TIMEOUT_SECONDS = 20 * 60
+MAX_SETUP_TIMEOUT_SECONDS = 60 * 60
+REMOTE_STAGING_DIR = "/workspace/coinrun-bundle"
+SSH_USER = "root"
+
+
+@dataclass(frozen=True)
+class BundlePlan:
+    manifest: dict[str, Any]
+    manifest_path: Path
+    archive_path: Path
+    base_image: str
+
+
+def validate_bundle_manifest(
+    manifest_path: Path,
+    *,
+    repo_root: Path,
+    bundle_dir: Path,
+) -> BundlePlan:
+    """Validate the checked-in manifest and the local archive it describes.
+
+    Runs before any RunPod mutation: a bad manifest or a mismatched archive must
+    never reach the point of launching a pod.
+    """
+
+    manifest = read_json(manifest_path)
+    if manifest.get("schema") != BUNDLE_SCHEMA:
+        raise DeploymentError(
+            f"{manifest_path} has schema {manifest.get('schema')!r}, expected "
+            f"{BUNDLE_SCHEMA!r}"
+        )
+    for section in ("archive", "extract", "source", "base_image", "contract_env"):
+        if not isinstance(manifest.get(section), dict):
+            raise DeploymentError(f"bundle manifest is missing the {section} object")
+
+    archive = manifest["archive"]
+    source = manifest["source"]
+    base = manifest["base_image"]
+
+    local_lock = sha256_file(repo_root / "uv.lock")
+    if source.get("uv_lock_sha256") != local_lock:
+        raise DeploymentError(
+            f"bundle manifest was built for uv.lock {source.get('uv_lock_sha256')} "
+            f"but this checkout has {local_lock}; rebuild the bundle"
+        )
+    contract_lock = manifest["contract_env"].get("COINRUN_UV_LOCK_SHA256")
+    if contract_lock != local_lock:
+        raise DeploymentError(
+            "bundle manifest contract env disagrees with its own source lock hash"
+        )
+    if manifest["extract"].get("target") != IMAGE_ROOT:
+        raise DeploymentError(
+            f"bundle manifest extracts to {manifest['extract'].get('target')!r}, "
+            f"expected {IMAGE_ROOT!r}"
+        )
+
+    filename = str(archive.get("filename") or "")
+    if not filename or "/" in filename or filename.startswith("."):
+        raise DeploymentError(f"bundle manifest archive filename is unsafe: {filename!r}")
+    archive_path = (bundle_dir / filename).resolve()
+    if not archive_path.is_file():
+        raise DeploymentError(
+            f"bundle archive {archive_path} is missing; rebuild it with "
+            "scripts/build_coinrun_bundle.py (it is intentionally not committed)"
+        )
+    expected_bytes = archive.get("bytes")
+    actual_bytes = archive_path.stat().st_size
+    if expected_bytes != actual_bytes:
+        raise DeploymentError(
+            f"bundle archive is {actual_bytes} bytes, manifest says {expected_bytes}"
+        )
+    expected_sha = str(archive.get("sha256") or "").lower()
+    if len(expected_sha) != 64:
+        raise DeploymentError("bundle manifest archive sha256 is malformed")
+    actual_sha = sha256_file(archive_path)
+    if actual_sha != expected_sha:
+        raise DeploymentError(
+            f"bundle archive sha256 {actual_sha} does not match manifest {expected_sha}"
+        )
+
+    reference = str(base.get("reference") or "")
+    digest = str(base.get("digest") or "")
+    if not reference or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise DeploymentError("bundle manifest base image reference/digest is malformed")
+    repository = reference.split(":")[0]
+    return BundlePlan(
+        manifest=manifest,
+        manifest_path=manifest_path,
+        archive_path=archive_path,
+        base_image=f"{repository}@{digest}",
+    )
+
+
+def read_public_key(path: Path) -> str:
+    """Read the SSH public key the pod will authorise. Never the private key."""
+
+    text = path.expanduser().read_text(encoding="utf-8").strip()
+    if not text or "PRIVATE KEY" in text:
+        raise DeploymentError(f"{path} is not an SSH public key")
+    if not text.startswith(("ssh-", "ecdsa-", "sk-")):
+        raise DeploymentError(f"{path} does not look like an OpenSSH public key")
+    if "\n" in text:
+        raise DeploymentError("SSH public key must be a single line")
+    return text
+
+
+def build_bundle_bootstrap(deadline_epoch: int) -> str:
+    """Start the absolute-deadline watchdog, then hand off to the base image.
+
+    Runs as the container's start command so the pod is bounded from the moment
+    it boots -- before any SSH setup, and independently of the local process.
+    """
+
+    if deadline_epoch <= 0:
+        raise DeploymentError("Bundle watchdog deadline is invalid")
+    helper = base64.b64encode(REMOTE_SELF_TERMINATE.encode("utf-8")).decode("ascii")
+    return textwrap.dedent(
+        """\
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        printf %%s %(helper)s | base64 -d > /tmp/coinrun_self_terminate.py
+        watchdog_delay=$((%(deadline_epoch)d - $(date +%%s)))
+        if [ "$watchdog_delay" -lt 0 ]; then watchdog_delay=0; fi
+        nohup python3 /tmp/coinrun_self_terminate.py \
+          "$watchdog_delay" hard-remote-deadline \
+          > /tmp/coinrun-bundle-watchdog.log 2>&1 &
+        exec /start.sh
+        """
+        % {"helper": shlex.quote(helper), "deadline_epoch": deadline_epoch}
+    )
+
+
+def make_bundle_pod_payload(
+    args: argparse.Namespace,
+    offer: GPUOffer,
+    plan: BundlePlan,
+    pod_name: str,
+    public_key: str,
+    deadline_epoch: int,
+) -> dict[str, Any]:
+    """Boot the pinned base image and let its own /start.sh bring up sshd.
+
+    No dockerEntrypoint/dockerStartCmd override here on purpose: the official
+    RunPod PyTorch image starts sshd from /start.sh when PUBLIC_KEY is present,
+    which is how the bundle gets in.
+    """
+
+    return {
+        "name": pod_name,
+        "imageName": plan.base_image,
+        "computeType": "GPU",
+        "gpuTypeIds": [offer.gpu_id],
+        "gpuTypePriority": "custom",
+        "gpuCount": 1,
+        "cloudType": args.cloud.upper(),
+        "interruptible": False,
+        "locked": False,
+        "containerDiskInGb": args.container_disk_gb,
+        "volumeInGb": 0,
+        "ports": ["8000/http", "22/tcp"],
+        "supportPublicIp": True,
+        "allowedCudaVersions": ["12.8", "12.9", "13.0"],
+        # PUBLIC_KEY only. The self-terminate helper uses the pod-scoped
+        # RUNPOD_API_KEY that RunPod injects, exactly as image mode does; the
+        # local account key must never be shipped to a pod.
+        "env": {"PUBLIC_KEY": public_key},
+        # The watchdog has to exist before SSH setup begins, otherwise a local
+        # crash between create_pod and teardown leaves an unbounded pod. Start
+        # it, then exec the base /start.sh so sshd still comes up.
+        "dockerEntrypoint": ["/bin/bash", "-lc"],
+        "dockerStartCmd": [encode_start_command(build_bundle_bootstrap(deadline_epoch))],
+    }
+
+
+def extract_ssh_endpoint(pod: dict[str, Any]) -> tuple[str, int] | None:
+    """Return (host, port) once RunPod publishes a public IP and a 22 mapping."""
+
+    host = pod.get("publicIp")
+    mappings = pod.get("portMappings")
+    if not host or not isinstance(mappings, dict):
+        return None
+    port = mappings.get("22") or mappings.get(22)
+    if port in (None, ""):
+        return None
+    try:
+        return str(host), int(port)
+    except (TypeError, ValueError):
+        return None
+
+
+def wait_for_ssh_endpoint(
+    api: RunPodAPI,
+    pod_id: str,
+    *,
+    deadline: float,
+    poll_seconds: float,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[str, int]:
+    while True:
+        pod = api.get_pod(pod_id)
+        if pod is None:
+            raise DeploymentError(f"Pod {pod_id} disappeared before SSH was available")
+        endpoint = extract_ssh_endpoint(pod)
+        if endpoint is not None:
+            return endpoint
+        if clock() >= deadline:
+            raise DeploymentError(
+                f"Pod {pod_id} did not publish a public IP and a 22/tcp mapping "
+                "within the setup budget"
+            )
+        sleep(poll_seconds)
+
+
+def ssh_command(
+    host: str,
+    port: int,
+    *,
+    key: Path,
+    known_hosts: Path,
+    remote: Sequence[str] | None = None,
+    connect_timeout: int = 15,
+) -> list[str]:
+    """SSH invocation with an isolated known_hosts file (never the user's)."""
+
+    command = [
+        "ssh", "-p", str(port), "-i", str(key),
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={known_hosts}",
+        "-o", f"ConnectTimeout={connect_timeout}",
+        "-o", "BatchMode=yes",
+        f"{SSH_USER}@{host}",
+    ]
+    if remote:
+        command.extend(remote)
+    return command
+
+
+def rsync_command(
+    source: Path,
+    host: str,
+    port: int,
+    *,
+    key: Path,
+    known_hosts: Path,
+    destination: str,
+) -> list[str]:
+    """Resumable rsync: --partial --append-verify survives a dropped link."""
+
+    ssh = " ".join(
+        shlex.quote(part)
+        for part in ssh_command(host, port, key=key, known_hosts=known_hosts)[:-1]
+    )
+    return [
+        "rsync", "--archive", "--partial", "--append-verify", "--compress-level=0",
+        "--timeout=120", "-e", ssh, str(source),
+        f"{SSH_USER}@{host}:{destination}",
+    ]
+
+
+REMOTE_SCRIPT_INSTALL = r"""
+set -Eeuo pipefail
+target="$1"
+expected_sha="$2"
+expected_bytes="$3"
+cat > "$target"
+actual_bytes="$(stat -c %s "$target")"
+test "$actual_bytes" = "$expected_bytes" || { echo "script size mismatch: $actual_bytes != $expected_bytes" >&2; exit 31; }
+actual_sha="$(sha256sum "$target" | cut -d' ' -f1)"
+test "$actual_sha" = "$expected_sha" || { echo "script sha mismatch: $actual_sha != $expected_sha" >&2; exit 32; }
+chmod +x "$target"
+echo "remote script installed"
+"""
+
+
+REMOTE_BUNDLE_SETUP = r"""
+set -Eeuo pipefail
+staging="$1"
+archive="$2"
+expected_sha="$3"
+expected_bytes="$4"
+target="$5"
+manifest="$6"
+manifest_sha="$7"
+manifest_bytes="$8"
+
+# Both uploaded files are checked against values computed locally before the
+# transfer. Nothing read from the pod is trusted to describe itself.
+verify() {
+  local path="$1" want_sha="$2" want_bytes="$3" label="$4" code="$5"
+  local got_bytes got_sha
+  got_bytes="$(stat -c %s "$path")"
+  test "$got_bytes" = "$want_bytes" || { echo "$label size mismatch: $got_bytes != $want_bytes" >&2; exit "$code"; }
+  got_sha="$(sha256sum "$path" | cut -d' ' -f1)"
+  test "$got_sha" = "$want_sha" || { echo "$label sha mismatch: $got_sha != $want_sha" >&2; exit $((code + 1)); }
+}
+
+verify "$staging/$archive" "$expected_sha" "$expected_bytes" bundle 11
+verify "$staging/$manifest" "$manifest_sha" "$manifest_bytes" manifest 21
+
+# Atomic: unpack beside the target, then rename into place.
+rm -rf "$target.incoming" "$target.old"
+mkdir -p "$target.incoming"
+zstd -d -c "$staging/$archive" | tar -x -C "$target.incoming"
+test -d "$target.incoming/coinrun" || { echo "archive lacks coinrun/" >&2; exit 13; }
+if [ -e "$target" ]; then mv "$target" "$target.old"; fi
+mv "$target.incoming/coinrun" "$target"
+rm -rf "$target.incoming" "$target.old"
+
+test -x "$target/venv/bin/python" || { echo "venv python missing" >&2; exit 14; }
+"$target/venv/bin/python" -c 'import jax, flax, optax'   || { echo "venv imports failed" >&2; exit 15; }
+test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "Procgen libenv.so missing from the uv cache" >&2; exit 16; }
+echo "bundle verified and installed at $target"
+"""
+
+
+def install_remote_bundle(
+    host: str,
+    port: int,
+    *,
+    key: Path,
+    known_hosts: Path,
+    plan: BundlePlan,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout: float | None = None,
+) -> None:
+    archive = plan.manifest["archive"]
+    command = ssh_command(
+        host, port, key=key, known_hosts=known_hosts,
+        remote=[
+            "bash", "-s", "--", REMOTE_STAGING_DIR, str(archive["filename"]),
+            str(archive["sha256"]), str(archive["bytes"]), IMAGE_ROOT,
+            plan.manifest_path.name,
+            sha256_file(plan.manifest_path),
+            str(plan.manifest_path.stat().st_size),
+        ],
+    )
+    result = runner(
+        command, input=REMOTE_BUNDLE_SETUP, text=True,
+        capture_output=True, check=False, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise DeploymentError(
+            f"remote bundle verification failed (exit {result.returncode}): "
+            f"{(result.stderr or result.stdout).strip()[:600]}"
+        )
+
+
+def append_transfer_telemetry(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def perform_bundle_setup(
+    api: RunPodAPI,
+    pod_id: str,
+    *,
+    plan: BundlePlan,
+    args: argparse.Namespace,
+    git_state: GitState,
+    stream_token: str,
+    deadline_epoch: int,
+    setup_deadline: float,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Transfer the bundle and start the existing bounded remote experiment.
+
+    Every step is inside the setup budget; exceeding it raises so the caller
+    terminates the pod. Returns telemetry only -- no credentials.
+    """
+
+    key = Path(args.ssh_key).expanduser()
+    # Pod-specific: a recycled IP:port must never match an earlier pod's host key.
+    known_hosts = (
+        Path(args.state).expanduser().resolve().parent / f"known_hosts.{pod_id}"
+    )
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    known_hosts.unlink(missing_ok=True)
+    started = clock()
+
+    host, port = wait_for_ssh_endpoint(
+        api, pod_id, deadline=setup_deadline,
+        poll_seconds=args.poll_seconds, clock=clock, sleep=sleep,
+    )
+    endpoint_seconds = clock() - started
+    print(f"Pod {pod_id} reachable on 22/tcp after {endpoint_seconds:.0f}s")
+
+    # Wait for sshd itself; /start.sh needs a moment after the mapping appears.
+    while True:
+        probe = runner(
+            ssh_command(host, port, key=key, known_hosts=known_hosts, remote=["true"]),
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        if probe.returncode == 0:
+            break
+        if clock() >= setup_deadline:
+            raise DeploymentError(
+                f"sshd on pod {pod_id} did not accept the key within the setup budget"
+            )
+        sleep(args.poll_seconds)
+    ssh_ready_seconds = clock() - started
+
+    prepare = runner(
+        ssh_command(
+            host, port, key=key, known_hosts=known_hosts,
+            remote=["mkdir", "-p", REMOTE_STAGING_DIR],
+        ),
+        capture_output=True, text=True, check=False, timeout=120,
+    )
+    if prepare.returncode != 0:
+        raise DeploymentError(
+            f"could not create {REMOTE_STAGING_DIR}: {prepare.stderr.strip()[:300]}"
+        )
+
+    transfer_started = clock()
+    for source in (plan.archive_path, plan.manifest_path):
+        transfer = runner(
+            rsync_command(
+                source, host, port, key=key, known_hosts=known_hosts,
+                destination=f"{REMOTE_STAGING_DIR}/",
+            ),
+            capture_output=True, text=True, check=False,
+            timeout=max(1.0, setup_deadline - clock()),
+        )
+        if transfer.returncode != 0:
+            raise DeploymentError(
+                f"rsync of {source.name} failed (exit {transfer.returncode}): "
+                f"{transfer.stderr.strip()[:400]}"
+            )
+    transfer_seconds = clock() - transfer_started
+    transfer_bytes = plan.archive_path.stat().st_size + plan.manifest_path.stat().st_size
+
+    verify_started = clock()
+    install_remote_bundle(
+        host, port, key=key, known_hosts=known_hosts, plan=plan,
+        runner=runner, timeout=max(1.0, setup_deadline - clock()),
+    )
+    verify_seconds = clock() - verify_started
+
+    remote_script = build_remote_script(
+        branch=git_state.branch,
+        commit_sha=git_state.commit_sha,
+        experiment_command=args.experiment_command,
+        runtime_seconds=args.runtime_seconds,
+        artifact_dir=args.remote_artifact_dir,
+        stream_token=stream_token,
+        deadline_epoch=deadline_epoch,
+        contract_env=dict(plan.manifest["contract_env"]),
+    )
+    # Two separate SSH calls. Combining them risks the backgrounded list
+    # returning before `cat` has consumed stdin, leaving a truncated script.
+    script_bytes = remote_script.encode("utf-8")
+    install = runner(
+        ssh_command(
+            host, port, key=key, known_hosts=known_hosts,
+            remote=[
+                "bash", "-s", "--", "/tmp/run_coinrun.sh",
+                hashlib.sha256(script_bytes).hexdigest(), str(len(script_bytes)),
+            ],
+        ),
+        input=REMOTE_SCRIPT_INSTALL, text=True, capture_output=True,
+        check=False, timeout=120,
+    )
+    if install.returncode != 0:
+        raise DeploymentError(
+            f"could not install the remote experiment script "
+            f"(exit {install.returncode}): "
+            f"{(install.stderr or install.stdout).strip()[:400]}"
+        )
+
+    launch = runner(
+        ssh_command(
+            host, port, key=key, known_hosts=known_hosts,
+            remote=[
+                "bash", "-lc",
+                shlex.quote(
+                    # RUNPOD_API_KEY lives in the pod environment, which an SSH
+                    # session does not inherit; /etc/rp_environment restores it
+                    # so the remote watchdog can self-terminate.
+                    "set -a; . /etc/rp_environment 2>/dev/null || true; set +a; "
+                    "nohup setsid bash /tmp/run_coinrun.sh "
+                    "> /tmp/run_coinrun.boot.log 2>&1 < /dev/null & echo started"
+                ),
+            ],
+        ),
+        text=True, capture_output=True, check=False, timeout=120,
+    )
+    if launch.returncode != 0:
+        raise DeploymentError(
+            f"could not start the remote experiment: {launch.stderr.strip()[:400]}"
+        )
+
+    if clock() > setup_deadline:
+        raise DeploymentError("bundle setup exceeded its budget before the experiment began")
+
+    total = clock() - started
+    return {
+        "ssh_host_known": True,
+        "ssh_port": port,
+        "launch_to_endpoint_seconds": round(endpoint_seconds, 3),
+        "launch_to_ssh_seconds": round(ssh_ready_seconds, 3),
+        "transfer_seconds": round(transfer_seconds, 3),
+        "transfer_bytes": transfer_bytes,
+        "transfer_bytes_per_second": round(transfer_bytes / max(transfer_seconds, 1e-6), 1),
+        "remote_verify_extract_seconds": round(verify_seconds, 3),
+        "experiment_started_utc": isoformat(utc_now()),
+        "setup_seconds": round(total, 3),
+    }
 
 
 def make_pod_payload(
@@ -1263,6 +1811,18 @@ def validate_runtime(value: int) -> None:
         )
 
 
+def validate_setup_timeout(value: int) -> int:
+    """Setup has its own budget; it is added to cost and to both watchdogs."""
+
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise DeploymentError("--setup-timeout-seconds must be a positive integer")
+    if value > MAX_SETUP_TIMEOUT_SECONDS:
+        raise DeploymentError(
+            f"--setup-timeout-seconds must not exceed {MAX_SETUP_TIMEOUT_SECONDS}"
+        )
+    return value
+
+
 def run_launch(
     args: argparse.Namespace,
     *,
@@ -1275,10 +1835,27 @@ def run_launch(
     validate_runtime(args.runtime_seconds)
     # Gate here as well as in validate_cli_args: run_launch is the only path
     # that can spend money, so it must fail closed regardless of entry point.
-    image_reference = validate_image_reference(args.image)
     validate_experiment_command(args.experiment_command)
     state_path = Path(args.state).expanduser().resolve()
     repo_root = Path(args.repo_root).resolve()
+    transport = getattr(args, "transport", "image")
+    setup_seconds = 0
+    plan: BundlePlan | None = None
+    public_key = ""
+    if transport == "bundle":
+        setup_seconds = validate_setup_timeout(args.setup_timeout_seconds)
+        plan = validate_bundle_manifest(
+            Path(args.bundle_manifest).expanduser().resolve(),
+            repo_root=repo_root,
+            bundle_dir=Path(args.bundle_dir).expanduser().resolve(),
+        )
+        public_key = read_public_key(Path(args.ssh_public_key))
+        if not Path(args.ssh_key).expanduser().is_file():
+            raise DeploymentError(f"SSH private key not found: {args.ssh_key}")
+        image_reference = {"reference": plan.base_image, "kind": "digest"}
+    else:
+        image_reference = validate_image_reference(args.image)
+    total_seconds = args.runtime_seconds + setup_seconds
     preflight_path = Path(args.preflight_report).expanduser().resolve()
     ensure_no_active_state(state_path)
     git_state = validate_git_preflight(repo_root, runner=git_runner)
@@ -1301,7 +1878,7 @@ def run_launch(
             f"Selected {args.gpu} is not available as one on-demand GPU "
             f"in {args.cloud} cloud"
         )
-    runtime_hours = Decimal(args.runtime_seconds) / Decimal(3600)
+    runtime_hours = Decimal(total_seconds) / Decimal(3600)
     projected = offer.hourly_price * runtime_hours
     buffer = _decimal(args.balance_buffer, "balance buffer")
     required_balance = projected + buffer
@@ -1315,7 +1892,8 @@ def run_launch(
 
     print(
         f"Selected {args.gpu} ({offer.gpu_id}); maximum projected compute "
-        f"spend=${_money(projected)} for {args.runtime_seconds}s"
+        f"spend=${_money(projected)} for {total_seconds}s "
+        f"({setup_seconds}s setup + {args.runtime_seconds}s experiment)"
     )
     print(
         f"Remote checkout: cl-1-koi/open-dreamer "
@@ -1327,7 +1905,7 @@ def run_launch(
 
     launch_clock = clock()
     launch_time = now()
-    deadline_utc = launch_time + timedelta(seconds=args.runtime_seconds)
+    deadline_utc = launch_time + timedelta(seconds=total_seconds)
     pod_name = (
         f"{POD_NAME_PREFIX}"
         f"{launch_time.strftime('%Y%m%d-%H%M%S')}-{git_state.commit_sha[:8]}"
@@ -1342,6 +1920,8 @@ def run_launch(
         "launch_time_utc": isoformat(launch_time),
         "hard_deadline_utc": isoformat(deadline_utc),
         "runtime_seconds": args.runtime_seconds,
+        "setup_timeout_seconds": setup_seconds,
+        "transport": transport,
         "gpu_choice": args.gpu,
         "gpu_type_id": offer.gpu_id,
         "cloud": args.cloud,
@@ -1364,15 +1944,20 @@ def run_launch(
             raise DeploymentError("Active RunPod state appeared during launch")
         write_json_atomic(state_path, provisional_state)
 
-    payload = make_pod_payload(
-        args,
-        offer,
-        git_state,
-        pod_name,
-        stream_token,
-        int(deadline_utc.timestamp()),
-    )
-    local_deadline = launch_clock + args.runtime_seconds
+    if plan is not None:
+        payload = make_bundle_pod_payload(
+            args, offer, plan, pod_name, public_key, int(deadline_utc.timestamp())
+        )
+    else:
+        payload = make_pod_payload(
+            args,
+            offer,
+            git_state,
+            pod_name,
+            stream_token,
+            int(deadline_utc.timestamp()),
+        )
+    local_deadline = launch_clock + total_seconds
     try:
         pod = api.create_pod(payload)
     except BaseException as exc:
@@ -1400,7 +1985,33 @@ def run_launch(
 
     failure: BaseException | None = None
     manifest: dict[str, Any] | None = None
-    if actual_hourly > offer.hourly_price:
+    if plan is not None and actual_hourly <= offer.hourly_price:
+        # Setup is bounded separately from the experiment and is inside the
+        # same local deadline, so a crash here still terminates the pod below.
+        try:
+            telemetry = perform_bundle_setup(
+                api, pod_id, plan=plan, args=args, git_state=git_state,
+                stream_token=stream_token,
+                deadline_epoch=int(deadline_utc.timestamp()),
+                setup_deadline=launch_clock + setup_seconds,
+                clock=clock,
+            )
+            update_state(state_path, phase="running", bundle_transfer=telemetry)
+            append_transfer_telemetry(
+                Path(args.transfer_telemetry).expanduser().resolve(),
+                {
+                    "schema": "coinrun-bundle-transfer-telemetry-v1",
+                    "pod_id": pod_id,
+                    "commit_sha": git_state.commit_sha,
+                    "archive_sha256": plan.manifest["archive"]["sha256"],
+                    **telemetry,
+                },
+            )
+        except BaseException as exc:
+            failure = exc
+    if failure is not None:
+        pass
+    elif actual_hourly > offer.hourly_price:
         failure = DeploymentError(
             f"Launched pod price ${_money(actual_hourly)}/hr exceeds "
             f"approved quote ${_money(offer.hourly_price)}/hr"
@@ -1597,8 +2208,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch.add_argument("--balance-buffer", type=Decimal, default=Decimal("5"))
     launch.add_argument(
+        "--transport",
+        choices=("image", "bundle"),
+        default="image",
+        help=(
+            "image: pull a prebuilt runner image. bundle: boot the pinned base "
+            "and transfer /opt/coinrun over SSH (no 26.5GB registry push)."
+        ),
+    )
+    launch.add_argument("--bundle-manifest", type=Path, default=DEFAULT_BUNDLE_MANIFEST)
+    launch.add_argument("--bundle-dir", type=Path, default=DEFAULT_BUNDLE_DIR)
+    launch.add_argument("--ssh-key", type=Path, default=Path("~/.ssh/id_ed25519"))
+    launch.add_argument(
+        "--ssh-public-key", type=Path, default=Path("~/.ssh/id_ed25519.pub")
+    )
+    launch.add_argument(
+        "--setup-timeout-seconds", type=int, default=DEFAULT_SETUP_TIMEOUT_SECONDS
+    )
+    launch.add_argument(
+        "--transfer-telemetry",
+        type=Path,
+        default=DEFAULT_BUNDLE_DIR / "transfer_telemetry.jsonl",
+    )
+    launch.add_argument(
         "--image",
-        required=True,
+        default=None,
         help=(
             "Immutable prebuilt runner image: "
             f"{RUNNER_IMAGE_REPOSITORY}@sha256:<digest> or :sha-<commit>"
@@ -1639,7 +2273,17 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_cli_args(args: argparse.Namespace) -> None:
     if args.command != "launch":
         return
-    validate_image_reference(args.image)
+    if getattr(args, "transport", "image") == "bundle":
+        validate_setup_timeout(args.setup_timeout_seconds)
+        if args.image is not None:
+            raise DeploymentError(
+                "--image is meaningless with --transport bundle; the base image "
+                "comes from the manifest's pinned digest"
+            )
+    else:
+        if args.image is None:
+            raise DeploymentError("--image is required with --transport image")
+        validate_image_reference(args.image)
     validate_experiment_command(args.experiment_command)
     if args.container_disk_gb < 50:
         raise DeploymentError("--container-disk-gb must be at least 50")

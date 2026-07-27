@@ -3,9 +3,16 @@
 Prebuilt OCI image that removes per-pod dependency installation from the CoinRun
 sprint. Nothing in this document launches paid compute.
 
+**Default transport is now the direct bundle, not a registry image.** Publishing
+26.46 GB is unnecessary when only `/opt/coinrun` (3.00 GB compressed) is absent
+from the pinned base. GHCR is optional/legacy; see "Image transport (legacy)".
+
 | Item | Value |
 |---|---|
-| Image | `ghcr.io/cl-1-koi/open-dreamer-coinrun-runner` |
+| Bundle manifest | `manifests/coinrun_runner_bundle.json` (tracked) |
+| Bundle archive | `artifacts/coinrun_bundle/*.tar.zst` (gitignored, rebuildable) |
+| Pinned base | `runpod/pytorch@sha256:60baa36d…` (from the manifest) |
+| Image (legacy) | `ghcr.io/cl-1-koi/open-dreamer-coinrun-runner` |
 | Base | `runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404` (CUDA 12.8) |
 | Tags | `sha-<40 hex commit>` only. **No `latest`.** |
 | Entrypoint | `coinrun-runner` (exec form), default `CMD` is `smoke` |
@@ -81,9 +88,110 @@ On a CPU-only host the full `smoke` mode correctly stops at the GPU gate
 `<artifact-dir>/runner/smoke.json` with `"status": "failed"`. That is the
 expected fail-closed result, not a bug.
 
-## Publish
+## Direct-bundle transport (default)
 
-**Supported path today: publish locally.** The finished image is 26.46 GB and
+### 1. Build the bundle from a verified local image
+
+```bash
+python scripts/build_coinrun_bundle.py --image coinrun-runner:slim
+```
+
+It refuses to package an image whose `COINRUN_UV_LOCK_SHA256` and
+`io.coinrun.uv.lock.sha256` disagree, or that was built for a different
+`uv.lock` than this checkout. It writes the archive under
+`artifacts/coinrun_bundle/` (never committed), the manifest to
+`manifests/coinrun_runner_bundle.json` (committed), and package telemetry to
+`artifacts/coinrun_bundle/package_telemetry.jsonl`.
+
+The pinned base must be present locally so its digest can be recorded:
+
+```bash
+sudo docker pull runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404
+```
+
+Measured on this host: 6.91 GB tar → 3.00 GB `.tar.zst` in 188 s at level 9.
+
+### 2. Dry run (validates everything locally, launches nothing)
+
+```bash
+python scripts/runpod_coinrun.py launch \
+  --transport bundle --gpu H200 \
+  --preflight-report artifacts/coinrun_preflight/telemetry.json \
+  --runtime-seconds 300 --setup-timeout-seconds 1200 \
+  --ssh-key ~/.ssh/id_ed25519 --ssh-public-key ~/.ssh/id_ed25519.pub \
+  --experiment-command 'coinrun-runner smoke --artifact-dir=$COINRUN_ARTIFACT_DIR'
+```
+
+Before any RunPod mutation this checks the manifest schema, that the manifest's
+`uv_lock_sha256` matches the local `uv.lock`, that `contract_env` agrees with
+it, that the extract target is `/opt/coinrun`, that the archive filename is not
+a traversal, and that the archive's size **and** SHA-256 match. Add `--execute`
+to launch.
+
+### 3. What the pod does
+
+1. Boots the pinned base by digest with `ports: ["8000/http", "22/tcp"]`,
+   `supportPublicIp`, and `PUBLIC_KEY` in env — no account credential is ever
+   put in the payload; the remote watchdog uses RunPod's injected pod-scoped
+   `RUNPOD_API_KEY`, sourced from `/etc/rp_environment` in SSH sessions.
+2. Its start command arms the self-terminate watchdog against the absolute
+   paid-work deadline, then `exec /start.sh` so sshd comes up. The pod is
+   bounded from boot, so a local crash cannot leave it running.
+3. The launcher polls REST `publicIp` + `portMappings["22"]`, waits for sshd,
+   rsyncs (`--partial --append-verify`, resumable) the archive and manifest to
+   `/workspace/coinrun-bundle` using a **pod-specific** `known_hosts`.
+4. Remotely verifies the size and SHA-256 of *both* files against values
+   computed locally, extracts atomically into `/opt/coinrun` (`.incoming` then
+   rename), and checks `venv/bin/python`, a `jax/flax/optax` import, and the
+   Procgen `libenv.so`.
+5. Installs the bounded remote experiment script in one synchronous SSH call
+   (verifying its bytes and hash), then starts it in a second call. The
+   existing HTTP log/artifact monitor on port 8000 is unchanged.
+
+### 4. Budgets and cost
+
+`--setup-timeout-seconds` (default 1200, max 3600) bounds everything up to the
+moment the experiment starts. It is added to `--runtime-seconds` for the
+projected-spend and balance check, for the local watchdog, and for the pod's
+absolute remote deadline. The experiment itself is bounded by exactly
+`--runtime-seconds`, so unused setup budget never extends training.
+
+Any setup failure raises, and the existing automatic-termination path runs.
+
+### 5. Transfer telemetry
+
+Appended to `artifacts/coinrun_bundle/transfer_telemetry.jsonl` and mirrored in
+the launcher state under `bundle_transfer`: `launch_to_endpoint_seconds`,
+`launch_to_ssh_seconds`, `transfer_seconds`, `transfer_bytes`,
+`transfer_bytes_per_second`, `remote_verify_extract_seconds`,
+`experiment_started_utc`, `setup_seconds`. No credentials are recorded.
+
+### 6. Recovery and reconstruction
+
+The archive is deliberately not committed. To recover it from a clean checkout:
+
+```bash
+python scripts/build_coinrun_runner.py --tag coinrun-runner:slim --cache-label cold
+python scripts/build_coinrun_bundle.py --image coinrun-runner:slim
+git diff --stat manifests/coinrun_runner_bundle.json   # expect archive.sha256 to differ
+```
+
+Reconstruction is **semantic, not bit-exact**. tar metadata is normalised
+(`--sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner`), but the payload
+still contains absolute paths, `UV_COMPILE_BYTECODE=1` `.pyc` files whose
+headers embed source mtimes, and uv cache entries with build-time-dependent
+contents. Expect a different `archive.sha256` with the same behaviour; the
+`source.dockerfile_sha256`, `source.uv_lock_sha256` and `base_image.digest`
+fields are what make the rebuild verifiable. If you rebuild, commit the updated
+manifest — a stale manifest fails the launcher's hash check by design.
+
+## Image transport (legacy, optional)
+
+The image transport still works and is unchanged: pass `--transport image`
+with an immutable `--image`. It is only needed if you specifically want a
+registry-distributed runner; the bundle transport requires no registry at all.
+
+**If you do publish: locally.** The finished image is 26.46 GB and
 the two-stage build additionally materialises the builder stage and the base, so
 peak disk usage is well above what a standard GitHub-hosted runner provides
 (~14 GB free on `/`, ~65 GB on `/mnt`). That has not been proven to fit, so the
