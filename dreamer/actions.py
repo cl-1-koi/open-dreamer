@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import Array
+import numpy as np
 from flax import struct
+from jax import Array
 
 
 @struct.dataclass
@@ -28,42 +28,97 @@ class Actions:
 
     def to_dict(self) -> dict[str, Array | None]:
         """Flatten Actions to a dict of arrays for serialization."""
-        actions = {"binary": self.binary, "categorical": self.categorical, "continuous": self.continuous}
-        return actions
+        return {
+            "binary": self.binary,
+            "categorical": self.categorical,
+            "continuous": self.continuous,
+        }
 
     @classmethod
     def from_dict(cls, d: dict[str, Array | None]) -> Actions:
-        """Reconstruct Actions from a flattened dict. Raise KeyError if a key is missing."""
-        return cls(binary=d["binary"], categorical=d["categorical"], continuous=d["continuous"])
+        """Reconstruct actions, treating omitted modalities as absent."""
+        return cls(
+            binary=d.get("binary"),
+            categorical=d.get("categorical"),
+            continuous=d.get("continuous"),
+        )
 
 
-def create_noop_action_like(template: Actions, categorical_action_dim: int) -> Actions:
-    """Creates a (B, 1, ...) no-op start action."""
+def _resolve_categorical_noop(
+    categorical_action_dim: int | None,
+    categorical_noop: int | None,
+) -> int:
+    if categorical_noop is None:
+        known_noops = {
+            15: 4,  # Procgen's discrete action space.
+            16: 4,  # Legacy OpenDreamer CoinRun config dimension.
+            NUM_CAMERA_CLASSES: NUM_CAMERA_CLASSES // 2,
+        }
+        categorical_noop = known_noops.get(categorical_action_dim, 0)
+
+    if categorical_action_dim is not None and not (
+        0 <= categorical_noop < categorical_action_dim
+    ):
+        raise ValueError(
+            f"categorical_noop={categorical_noop} is outside the action space "
+            f"[0, {categorical_action_dim})."
+        )
+    return categorical_noop
+
+
+def create_noop_action_like(
+    template: Actions,
+    categorical_action_dim: int | None = None,
+    *,
+    categorical_noop: int | None = None,
+) -> Actions:
+    """Create a ``(B, 1, ...)`` start action matching present modalities.
+
+    Known Procgen/CoinRun and VPT dimensions retain their environment no-op.
+    Other categorical spaces use index zero unless ``categorical_noop`` is
+    supplied explicitly.
+    """
+
+    categorical_fill = _resolve_categorical_noop(
+        categorical_action_dim,
+        categorical_noop,
+    )
 
     def _create_action(arr, fill_value):
-        if arr is None: return None
+        if arr is None:
+            return None
         return jnp.full_like(arr[:, 0:1], fill_value)
 
     return Actions(
-        binary     = _create_action(template.binary, 0),
-        categorical = _create_action(template.categorical, categorical_action_dim//2), #verified that this is equal to mouse_movement_to_categorical(dx=0,dy=0)
-        continuous  = _create_action(template.continuous, 0.)
+        binary=_create_action(template.binary, 0),
+        categorical=_create_action(template.categorical, categorical_fill),
+        continuous=_create_action(template.continuous, 0.0),
     )
 
 
-def shift_actions(actions: Actions, categorical_action_dim: int) -> Actions:
-    """Shift actions right by 1, preprend noop action."""
+def shift_actions(
+    actions: Actions,
+    categorical_action_dim: int | None = None,
+    *,
+    categorical_noop: int | None = None,
+) -> Actions:
+    """Shift actions right by one and prepend a modality-matched start action."""
 
-    noop_action = create_noop_action_like(actions, categorical_action_dim)
-    
+    noop_action = create_noop_action_like(
+        actions,
+        categorical_action_dim,
+        categorical_noop=categorical_noop,
+    )
+
     def _shift(current_arr, start_arr):
-        if current_arr is None: return None
+        if current_arr is None:
+            return None
         return jnp.concatenate([start_arr, current_arr[:, :-1]], axis=1)
 
     return Actions(
-        binary      = _shift(actions.binary, noop_action.binary),
-        categorical = _shift(actions.categorical, noop_action.categorical),
-        continuous  = _shift(actions.continuous, noop_action.continuous)
+        binary=_shift(actions.binary, noop_action.binary),
+        categorical=_shift(actions.categorical, noop_action.categorical),
+        continuous=_shift(actions.continuous, noop_action.continuous),
     )
 
 
