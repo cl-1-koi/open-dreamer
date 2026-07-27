@@ -32,6 +32,7 @@ from typing import Any, Callable, Iterator, Sequence
 MAX_RUNTIME_SECONDS = 4 * 60 * 60
 MIN_RUNTIME_SECONDS = 5 * 60
 REMOTE_FINALIZATION_SECONDS = 120
+PROXY_STARTUP_GRACE_SECONDS = 10 * 60
 DEFAULT_CONFIG = Path.home() / ".runpod" / "config.toml"
 GITHUB_REPO_URL = "https://github.com/cl-1-koi/open-dreamer.git"
 POD_NAME_PREFIX = "coinrun-reconstruction-"
@@ -885,7 +886,7 @@ def fetch_log_chunk(
             next_offset = int(response.headers.get("X-Next-Offset", offset + len(data)))
         return data, next_offset
     except urllib.error.HTTPError as exc:
-        if exc.code in {404, 502, 503, 504}:
+        if exc.code in {403, 404, 502, 503, 504}:
             return None
         raise DeploymentError(
             f"RunPod log stream returned HTTP {exc.code}"
@@ -911,7 +912,7 @@ def fetch_manifest(
         with opener(request, timeout=timeout) as response:
             data = response.read(8 * 1024 * 1024)
     except urllib.error.HTTPError as exc:
-        if exc.code in {404, 502, 503, 504}:
+        if exc.code in {403, 404, 502, 503, 504}:
             return None
         raise DeploymentError(
             f"RunPod artifact manifest returned HTTP {exc.code}"
@@ -1014,6 +1015,10 @@ def monitor_pod(
     manifest_path = local_dir / "artifact-manifest.json"
     archive_path = local_dir / "artifacts.tar.gz"
     log_offset = 0
+    proxy_ready = False
+    proxy_ready_deadline = min(
+        deadline, clock() + PROXY_STARTUP_GRACE_SECONDS
+    )
 
     while True:
         remaining = deadline - clock()
@@ -1028,6 +1033,7 @@ def monitor_pod(
             timeout=min(15.0, remaining),
         )
         if chunk is not None:
+            proxy_ready = True
             data, log_offset = chunk
             if data:
                 with log_path.open("ab") as handle:
@@ -1042,6 +1048,7 @@ def monitor_pod(
             timeout=min(15.0, remaining),
         )
         if manifest is not None:
+            proxy_ready = True
             write_json_atomic(manifest_path, manifest)
             if manifest.get("complete") is True:
                 if manifest.get("commit_sha") != state.get("commit_sha"):
@@ -1068,6 +1075,11 @@ def monitor_pod(
                     last_observed_utc=isoformat(utc_now()),
                 )
                 return manifest
+        if not proxy_ready and clock() >= proxy_ready_deadline:
+            raise DeploymentError(
+                "RunPod HTTP proxy did not expose the telemetry service "
+                f"within {PROXY_STARTUP_GRACE_SECONDS} seconds"
+            )
 
         pod = api.get_pod(pod_id)
         if pod is None:

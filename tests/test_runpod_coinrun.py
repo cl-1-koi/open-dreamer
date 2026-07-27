@@ -262,6 +262,23 @@ class CredentialAndHTTPTests(unittest.TestCase):
             {"offset": ["0"], "token": ["stream-secret"]},
         )
 
+    def test_proxy_forbidden_is_transient_during_pod_startup(self):
+        def opener(request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "not ready", {}, None
+            )
+
+        self.assertIsNone(
+            runpod_coinrun.fetch_log_chunk(
+                "pod-1", 0, "stream-secret", opener=opener
+            )
+        )
+        self.assertIsNone(
+            runpod_coinrun.fetch_manifest(
+                "pod-1", "stream-secret", opener=opener
+            )
+        )
+
 
 class GitAndPreflightGateTests(unittest.TestCase):
     def test_accepts_only_clean_pushed_cl1koi_tip(self):
