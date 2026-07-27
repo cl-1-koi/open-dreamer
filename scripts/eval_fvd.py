@@ -46,6 +46,42 @@ OmegaConf.register_new_resolver("floordiv", lambda x, y: x // y)
 OmegaConf.register_new_resolver("max", lambda *args: max(args))
 
 
+def validate_dataset_action_config(dataset_cfg) -> dict:
+    """Resolve and validate the categorical action shift contract."""
+    resolved = OmegaConf.to_container(
+        dataset_cfg,
+        resolve=True,
+        throw_on_missing=True,
+    )
+    if not isinstance(resolved, dict):
+        raise TypeError(
+            f"Expected a mapping dataset config, got {type(resolved).__name__}."
+        )
+    if "categorical_noop" not in resolved:
+        raise ValueError("dataset.categorical_noop must be explicitly configured.")
+
+    categorical_dim = resolved.get("categorical_action_dim")
+    categorical_noop = resolved["categorical_noop"]
+    if type(categorical_dim) is not int or categorical_dim < 0:
+        raise ValueError(
+            "dataset.categorical_action_dim must be a non-negative integer; "
+            f"got {categorical_dim!r}."
+        )
+    if categorical_dim == 0:
+        if categorical_noop is not None:
+            raise ValueError(
+                "dataset.categorical_noop must be null when categorical actions are disabled."
+            )
+    elif type(categorical_noop) is not int or not (
+        0 <= categorical_noop < categorical_dim
+    ):
+        raise ValueError(
+            "dataset.categorical_noop must be an integer in "
+            f"[0, {categorical_dim}); got {categorical_noop!r}."
+        )
+    return resolved
+
+
 def _save_video(frames, path, fps=20):
     """Save (T, H, W, C) uint8 array as MP4."""
     iio.imwrite(str(path), frames, plugin="pyav", fps=fps, codec="libx264")
@@ -53,6 +89,8 @@ def _save_video(frames, path, fps=20):
 
 def generate_videos(cfg):
     """Stage 1: Generate videos and save as individual MP4s."""
+    validate_dataset_action_config(cfg.dataset)
+
     dynamics_ckpt = cfg.dynamics_ckpt
     assert dynamics_ckpt, "dynamics_ckpt must be set for generation"
 
@@ -123,7 +161,11 @@ def generate_videos(cfg):
             else:
                 val_data = batch["videos"]
             val_actions = batch["actions"]
-            val_actions = shift_actions(val_actions, cfg.dataset.categorical_action_dim)
+            val_actions = shift_actions(
+                val_actions,
+                cfg.dataset.categorical_action_dim,
+                categorical_noop=cfg.dataset.categorical_noop,
+            )
 
             B_batch = val_data.shape[0]
 

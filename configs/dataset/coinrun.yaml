@@ -60,7 +60,8 @@ patch_size: 8
 
 # CoinRun uses categorical actions in this config.
 num_binary_actions: 0
-categorical_action_dim: 16
+categorical_action_dim: 15
+categorical_noop: 4
 continuous_action_dim: 0
 
 # Pixel normalization stats for values in [0, 1]. The std is sqrt(1/12), the

@@ -29,6 +29,8 @@ class CoinRunConfigTest(unittest.TestCase):
         self.assertEqual(resolved["dataset"]["data_type"], "video")
         self.assertEqual(resolved["dataset"]["dataloader_cfg"]["B"], 2)
         self.assertEqual(resolved["dataset"]["dataloader_cfg"]["long_T"], 16)
+        self.assertEqual(resolved["dataset"]["categorical_action_dim"], 15)
+        self.assertEqual(resolved["dataset"]["categorical_noop"], 4)
         self.assertEqual(resolved["tokenizer"]["encoder"]["n_latents"], 32)
         self.assertEqual(resolved["tokenizer"]["encoder"]["d_bottleneck"], 8)
         self.assertEqual(resolved["tokenizer"]["encoder"]["depth"], 2)
@@ -57,7 +59,8 @@ class CoinRunConfigTest(unittest.TestCase):
         self.assertEqual(resolved["dynamics"]["d_bottleneck"], 8)
         self.assertEqual(resolved["dynamics"]["context_length"], 16)
         self.assertEqual(resolved["dynamics"]["n_register"], 4)
-        self.assertEqual(resolved["dynamics"]["categorical_action_dim"], 16)
+        self.assertEqual(resolved["dataset"]["categorical_noop"], 4)
+        self.assertEqual(resolved["dynamics"]["categorical_action_dim"], 15)
         self.assertIsNone(resolved["dynamics"]["latent_mean"])
         self.assertIsNone(resolved["dynamics"]["latent_std"])
         self.assertEqual(resolved["bootstrap_start"], 100)
@@ -71,6 +74,7 @@ class CoinRunConfigTest(unittest.TestCase):
         self.assertEqual(dynamics_cfg.dataset.name, "minecraft_vpt_latent")
         self.assertEqual(dynamics_cfg.dataset.num_binary_actions, 27)
         self.assertEqual(dynamics_cfg.dataset.categorical_action_dim, 121)
+        self.assertEqual(dynamics_cfg.dataset.categorical_noop, 60)
         train_dynamics.validate_dynamics_config(dynamics_cfg)
 
     def test_coinrun_config_rejects_unknown_override_without_explicit_add(self):

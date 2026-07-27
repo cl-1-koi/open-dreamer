@@ -26,6 +26,7 @@ num_max_samples: -1
 # Action dimensions must match the raw dataset and the dynamics model.
 num_binary_actions: 27
 categorical_action_dim: 121
+categorical_noop: 60
 continuous_action_dim: 0
 
 # Must match the representation used during tokenization. Valid values are

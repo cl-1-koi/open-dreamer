@@ -45,6 +45,7 @@ class DatasetConfig:
     # Dataset path and action space
     num_binary_actions: int = 0
     categorical_action_dim: int = 0
+    categorical_noop: int | None = None
     continuous_action_dim: int = 0
     mouse_repr: str = "categorical"  # "categorical" (mu-law bins, default) or "continuous" ([dx, dy])
     array_record_path: str = "datasets/coinrun_episodes/train"

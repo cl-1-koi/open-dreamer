@@ -25,17 +25,15 @@ from dreamer.data.generate_coinrun_dataset import (
 from dreamer.data.transforms import EpisodeLengthFilter, ProcessEpisodeAndSlice
 
 
-@pytest.mark.parametrize("categorical_action_dim", [15, 16])
-def test_categorical_only_actions_shift_with_coinrun_noop(
-    categorical_action_dim: int,
-) -> None:
+def test_categorical_only_actions_shift_with_explicit_coinrun_noop() -> None:
     actions = Actions.from_dict(
         {"categorical": jnp.asarray([[1, 2, 8], [7, 4, 3]], dtype=jnp.int32)}
     )
 
     shifted = shift_actions(
         actions,
-        categorical_action_dim=categorical_action_dim,
+        categorical_action_dim=15,
+        categorical_noop=4,
     )
 
     np.testing.assert_array_equal(
@@ -53,7 +51,11 @@ def test_action_shift_keeps_legacy_vpt_camera_center() -> None:
         continuous=jnp.ones((1, 3, 2), dtype=jnp.float32),
     )
 
-    shifted = shift_actions(actions, categorical_action_dim=121)
+    shifted = shift_actions(
+        actions,
+        categorical_action_dim=121,
+        categorical_noop=60,
+    )
 
     np.testing.assert_array_equal(shifted.categorical, [[60, 12, 13]])
     np.testing.assert_array_equal(shifted.binary[:, 0], [[0, 0]])

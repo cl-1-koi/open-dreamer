@@ -88,6 +88,7 @@ num_binary_actions: 27
 # Number of categorical mouse/action classes. With `mouse_repr: categorical`,
 # this must be > 0 and match the parser/model expectation.
 categorical_action_dim: 121
+categorical_noop: 60
 
 # Number of continuous action channels. With `mouse_repr: continuous`, this must
 # be > 0. It is 0 for the categorical mouse setup.

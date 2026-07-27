@@ -29,14 +29,36 @@ class TrainDynamicsConfigTest(unittest.TestCase):
     def test_action_dimensions_reject_dataset_model_mismatch(self):
         cfg = compose_config(
             "coinrun_dynamics",
-            overrides=["dynamics.categorical_action_dim=15"],
+            overrides=["dynamics.categorical_action_dim=14"],
         )
 
         with self.assertRaisesRegex(
             ValueError,
-            "categorical_action_dim.*dataset=16, dynamics=15",
+            "categorical_action_dim.*dataset=15, dynamics=14",
         ):
             validate_dynamics_config(cfg)
+
+    def test_action_config_rejects_missing_or_invalid_categorical_noop(self):
+        cases = (
+            (
+                ["~dataset.categorical_noop"],
+                "categorical_noop must be explicitly configured",
+            ),
+            (
+                ["dataset.categorical_noop=15"],
+                r"categorical_noop must be an integer in \[0, 15\)",
+            ),
+            (
+                ["dataset.categorical_noop=null"],
+                r"categorical_noop must be an integer in \[0, 15\)",
+            ),
+        )
+
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                cfg = compose_config("coinrun_dynamics", overrides=overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_dynamics_config(cfg)
 
     def test_config_validation_rejects_missing_resolved_value(self):
         cfg = compose_config(

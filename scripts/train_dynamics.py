@@ -198,6 +198,23 @@ def validate_dynamics_config(cfg: DynamicsConfig) -> dict:
                 f"dataset={dataset_dim}, dynamics={model_dim}."
             )
 
+    if "categorical_noop" not in dataset_cfg:
+        raise ValueError("dataset.categorical_noop must be explicitly configured.")
+    categorical_dim = dataset_cfg["categorical_action_dim"]
+    categorical_noop = dataset_cfg["categorical_noop"]
+    if categorical_dim == 0:
+        if categorical_noop is not None:
+            raise ValueError(
+                "dataset.categorical_noop must be null when categorical actions are disabled."
+            )
+    elif type(categorical_noop) is not int or not (
+        0 <= categorical_noop < categorical_dim
+    ):
+        raise ValueError(
+            "dataset.categorical_noop must be an integer in "
+            f"[0, {categorical_dim}); got {categorical_noop!r}."
+        )
+
     return resolved
 
 
@@ -345,7 +362,11 @@ def run(cfg: DynamicsConfig):
                 input_tensor = latents if latents is not None else videos
 
                 validate_action_batch(actions, cfg, input_tensor.shape[:2])
-                actions = shift_actions(actions, cfg.dataset.categorical_action_dim)
+                actions = shift_actions(
+                    actions,
+                    cfg.dataset.categorical_action_dim,
+                    categorical_noop=cfg.dataset.categorical_noop,
+                )
 
                 # Validation/visualization — all hosts must participate in JAX
                 # compute (model is sharded), but only process 0 does I/O.
