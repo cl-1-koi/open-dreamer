@@ -1473,7 +1473,12 @@ dataset_python="$(find "$target/uv-cache/environments-v2" -mindepth 3 -maxdepth 
   -path '*/bin/python' -type l -print -quit)"
 test -n "$dataset_python" && test -x "$dataset_python" \
   || { echo "prewarmed CoinRun dataset Python missing" >&2; exit 16; }
-ln -sfn "$dataset_python" /usr/local/bin/coinrun-dataset-python
+# Executing a uv environment through a symlink outside that environment makes
+# Python rediscover the wrong prefix and lose the environment's site-packages.
+# A shell wrapper preserves the original executable path and its pyvenv.cfg.
+printf '#!/bin/sh\nexec "%s" "$@"\n' "$dataset_python" \
+  > /usr/local/bin/coinrun-dataset-python
+chmod 0755 /usr/local/bin/coinrun-dataset-python
 "$target/venv/bin/python" -c 'import jax, flax, optax'   || { echo "venv imports failed" >&2; exit 17; }
 test -n "$(find "$target/uv-cache" -name libenv.so -print -quit)"   || { echo "Procgen libenv.so missing from the uv cache" >&2; exit 18; }
 # The image builds /usr/local/bin/coinrun-runner outside /opt/coinrun, so the

@@ -1,12 +1,12 @@
 {
   "archive": {
-    "bytes": 3020906356,
+    "bytes": 3040042752,
     "compression": "zstd",
     "compression_level": 9,
-    "filename": "coinrun-opt-13c0534ef057.tar.zst",
-    "sha256": "958a2febba08f786f9be1886c1239a0f32634999f1ae12f87f4c8e3cae1c98ae",
-    "uncompressed_bytes": 6964398080,
-    "uncompressed_tar_sha256": "bfaf09d24949d41433be002a3791fe0d6912646859f8f34a9e7d8c9b4b3cefaf"
+    "filename": "coinrun-opt-e5da218314ba.tar.zst",
+    "sha256": "0e78329c884ef391e42ce5b2b0f2a4cf265c493037bed32028d8b79049c32626",
+    "uncompressed_bytes": 7025725440,
+    "uncompressed_tar_sha256": "3b1288b759eda76d0cb331813559185c18c1a40afb0908a71b7353234fe722b7"
   },
   "base_image": {
     "digest": "sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f",
@@ -22,14 +22,14 @@
     }
   },
   "build_inputs": {
-    "dockerfile_sha256": "7232942efde08b3494c8f84e0c39015e9be3cafe20bb0929297a45e07735513c",
+    "dockerfile_sha256": "abf4cf162bbe86062dbd301ee09444157a6e0c2fb880fb5e58106450b74d8849",
     "generator_dependency_sha256": "861a4977c7c296e24a34cf6564cb18765151183223711bf9bb2120510d03ccd4",
     "generator_sha256": "a8215427441771de19ebe9f1231dc202326ea4a05d64b9c64e88345577856567",
     "uv_lock_sha256": "795e24f0e9b1ec29a41064721afd40910af73ff0233f4c4114eecd773281f066"
   },
   "contract_env": {
     "COINRUN_IMAGE_CONTRACT": "1",
-    "COINRUN_SOURCE_COMMIT": "13c0534ef057f30ef2c8f4f5913dc5d1171dda1c",
+    "COINRUN_SOURCE_COMMIT": "e5da218314bae513a3103bd5da39c66c9efb3aff",
     "COINRUN_UV_LOCK_SHA256": "795e24f0e9b1ec29a41064721afd40910af73ff0233f4c4114eecd773281f066",
     "UV_CACHE_DIR": "/opt/coinrun/uv-cache",
     "UV_COMPILE_BYTECODE": "1",
@@ -38,7 +38,7 @@
     "UV_PYTHON_DOWNLOADS": "never",
     "UV_PYTHON_INSTALL_DIR": "/opt/coinrun/python"
   },
-  "created_utc": "2026-07-27T06:35:06.965865Z",
+  "created_utc": "2026-07-27T07:07:25.257895Z",
   "extract": {
     "expected_top_level": "coinrun",
     "parent": "/opt",
@@ -46,9 +46,9 @@
   },
   "schema": "coinrun-runner-bundle-v1",
   "source": {
-    "commit": "13c0534ef057f30ef2c8f4f5913dc5d1171dda1c",
-    "dockerfile_sha256": "7232942efde08b3494c8f84e0c39015e9be3cafe20bb0929297a45e07735513c",
-    "image_id": "sha256:3ae4fa9bf9591cb9140ae5ea9e544e477b2a606f824286619dd0cd69d9c9b5d6",
+    "commit": "e5da218314bae513a3103bd5da39c66c9efb3aff",
+    "dockerfile_sha256": "abf4cf162bbe86062dbd301ee09444157a6e0c2fb880fb5e58106450b74d8849",
+    "image_id": "sha256:f8c8bd095e137ac3712c475e56cdf1bccf36fd95e3312a1726cba3c7251b231a",
     "image_reference": "coinrun-runner:slim",
     "uv_lock_sha256": "795e24f0e9b1ec29a41064721afd40910af73ff0233f4c4114eecd773281f066"
   }

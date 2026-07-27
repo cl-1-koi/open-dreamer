@@ -417,6 +417,11 @@ class BundleShimTests(unittest.TestCase):
         script = rc.REMOTE_BUNDLE_SETUP
         self.assertIn('dataset_python="$(find "$target/uv-cache/environments-v2"', script)
         self.assertIn("/usr/local/bin/coinrun-dataset-python", script)
+        self.assertIn('exec "%s" "$@"', script)
+        self.assertNotIn(
+            'ln -sfn "$dataset_python" /usr/local/bin/coinrun-dataset-python',
+            script,
+        )
 
     def test_remote_setup_adds_procgen_and_nvidia_libraries_to_the_loader_path(self):
         script = rc.REMOTE_BUNDLE_SETUP

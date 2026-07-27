@@ -166,11 +166,12 @@ RUN nvidia_libs="$(find /opt/coinrun/venv/lib/python3.11/site-packages/nvidia \
     && dataset_python="$(find /opt/coinrun/uv-cache/environments-v2 \
         -mindepth 3 -maxdepth 3 -path '*/bin/python' -type l -print -quit)" \
     && test -n "$dataset_python" \
-    && ln -s "$dataset_python" /usr/local/bin/coinrun-dataset-python \
+    && printf '#!/bin/sh\nexec "%s" "$@"\n' "$dataset_python" \
+      > /usr/local/bin/coinrun-dataset-python \
     && printf '#!/bin/sh\nexport LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\nexec /opt/coinrun/venv/bin/python /opt/coinrun/runner/coinrun_runner.py "$@"\n' \
       "$runtime_libs" \
       > /usr/local/bin/coinrun-runner \
-    && chmod 0755 /usr/local/bin/coinrun-runner
+    && chmod 0755 /usr/local/bin/coinrun-dataset-python /usr/local/bin/coinrun-runner
 
 WORKDIR /workspace
 
