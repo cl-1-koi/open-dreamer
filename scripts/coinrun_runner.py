@@ -8,6 +8,8 @@ and commit we intended, then hands off to code that already exists:
                 one JSON result, hard aggregate budget.
 ``experiment``  ``exec`` into scripts/run_coinrun_h100_experiment.sh so its own
                 deadlines and signal handling apply unchanged.
+``paired-experiment``
+                ``exec`` into the exact-corpus paired H200 controller.
 
 RunPod lifecycle, artifact packing and log streaming stay in
 scripts/runpod_coinrun.py. Scientific thresholds stay in the controller.
@@ -223,10 +225,36 @@ def exec_experiment(args: argparse.Namespace, checkout: Path, env: dict[str, str
     os.execvpe("bash", command, env)
 
 
+def exec_paired_experiment(
+    args: argparse.Namespace,
+    checkout: Path,
+    env: dict[str, str],
+) -> None:
+    """Hand off to the exact-corpus paired controller without losing runner env."""
+    controller = checkout / "scripts" / "run_paired_coinrun_h200_experiment.sh"
+    if not controller.is_file():
+        raise ContractError(f"paired experiment controller missing at {controller}")
+    command = [
+        "bash",
+        str(controller),
+        "--artifact-dir",
+        str(Path(args.artifact_dir) / "experiment"),
+        "--dataset-dir",
+        str(Path(args.dataset_dir).expanduser().resolve()),
+        "--manifest-sha256",
+        args.manifest_sha256,
+        "--seed",
+        str(args.seed),
+    ]
+    print(f"coinrun-runner: exec {' '.join(command)}", flush=True)
+    os.chdir(checkout)
+    os.execvpe("bash", command, env)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="mode", required=True)
-    for name in ("smoke", "experiment"):
+    for name in ("smoke", "experiment", "paired-experiment"):
         mode = sub.add_parser(name)
         mode.add_argument(
             "--checkout-root",
@@ -244,6 +272,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.choices["experiment"].add_argument(
         "--preset", choices=("initial", "fallback"), default="initial"
     )
+    paired = sub.choices["paired-experiment"]
+    paired.add_argument("--dataset-dir", required=True)
+    paired.add_argument("--manifest-sha256", required=True)
     return parser
 
 
@@ -263,6 +294,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result["gpu"] = check_gpu(checkout, env)
         if args.mode == "experiment":
             exec_experiment(args, checkout, env)  # never returns
+        if args.mode == "paired-experiment":
+            exec_paired_experiment(args, checkout, env)  # never returns
         result["smoke"] = run_smoke(args, checkout, env)
         result["status"] = "passed"
     except ContractError as exc:

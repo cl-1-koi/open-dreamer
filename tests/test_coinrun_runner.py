@@ -378,6 +378,36 @@ class FailureArtifactTests(unittest.TestCase):
             payload = json.loads((artifacts / "runner" / "experiment.json").read_text())
             self.assertIn("controller missing", payload["error"])
 
+    def test_paired_experiment_mode_reports_a_missing_controller(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, lock_sha, commit = make_checkout(root)
+            artifacts = root / "artifacts"
+            dataset = root / "paired"
+            dataset.mkdir()
+            with environment(
+                COINRUN_IMAGE_CONTRACT="1", COINRUN_UV_LOCK_SHA256=lock_sha
+            ):
+                original_tools, original_gpu = runner.check_tools, runner.check_gpu
+                runner.check_tools = lambda *a, **k: {}
+                runner.check_gpu = lambda *a, **k: {}
+                try:
+                    code = runner.main([
+                        "paired-experiment",
+                        f"--checkout-root={checkout}",
+                        f"--artifact-dir={artifacts}",
+                        f"--expect-commit={commit}",
+                        f"--dataset-dir={dataset}",
+                        f"--manifest-sha256={'a' * 64}",
+                    ])
+                finally:
+                    runner.check_tools, runner.check_gpu = original_tools, original_gpu
+            self.assertEqual(code, 1)
+            payload = json.loads(
+                (artifacts / "runner" / "paired-experiment.json").read_text()
+            )
+            self.assertIn("paired experiment controller missing", payload["error"])
+
     def test_dataset_failure_preserves_the_failed_command_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
