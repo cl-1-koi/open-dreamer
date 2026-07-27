@@ -138,6 +138,31 @@ locally and on the operator-owned relay; neither copy is a Git object.
 
 ### 3. Dry run (validates everything locally, launches nothing)
 
+The preferred path uses the persistent RunPod network-volume cache. The
+volume and pod must be in the same data center:
+
+```bash
+python scripts/runpod_coinrun.py launch \
+  --transport bundle --gpu H200 \
+  --preflight-report artifacts/coinrun_preflight/telemetry.json \
+  --runtime-seconds 300 --setup-timeout-seconds 600 \
+  --network-volume-id 77iy0y26si \
+  --network-volume-data-center-id US-NC-1 \
+  --network-volume-mount-path /runpod-volume \
+  --bundle-volume-dir /runpod-volume/coinrun-bundles \
+  --ssh-key artifacts/runpod_coinrun/pod-transfer-key \
+  --ssh-public-key artifacts/runpod_coinrun/pod-transfer-key.pub \
+  --experiment-command 'coinrun-runner smoke --artifact-dir=$COINRUN_ARTIFACT_DIR'
+```
+
+With `--bundle-volume-dir`, setup verifies and extracts the cached archive but
+does not run rsync. The launcher records the volume ID, data center, mount,
+verified byte count, and zero network-transfer bytes in its state and transfer
+telemetry. `--bundle-volume-dir` and `--bundle-relay-host` are mutually
+exclusive.
+
+The relay path remains available as a reconstruction fallback:
+
 ```bash
 python scripts/runpod_coinrun.py launch \
   --transport bundle --gpu H200 \
@@ -165,12 +190,13 @@ to launch.
 2. Its start command arms the self-terminate watchdog against the absolute
    paid-work deadline, then `exec /start.sh` so sshd comes up. The pod is
    bounded from boot, so a local crash cannot leave it running.
-3. The launcher polls REST `publicIp` + `portMappings["22"]`, waits for sshd,
-   and asks the selected relay to rsync (`--partial --append-verify`,
-   resumable) the archive and manifest directly to
+3. The launcher polls REST `publicIp` + `portMappings["22"]` and waits for
+   sshd. With `--bundle-volume-dir`, it reads the archive and manifest directly
+   from the attached network volume. Otherwise, it asks the selected relay to
+   rsync (`--partial --append-verify`, resumable) both files to
    `/workspace/coinrun-bundle`. The relay receives the pod's ephemeral private
    key only for this operation and removes it and its pod-specific
-   `known_hosts` file even if rsync fails. Without `--bundle-relay-host`, the
+   `known_hosts` file even if rsync fails. Without either source option, the
    original local-to-pod path remains available.
 4. Remotely verifies the size and SHA-256 of *both* files against values
    computed locally, extracts atomically into `/opt/coinrun` (`.incoming` then
@@ -195,7 +221,8 @@ Any setup failure raises, and the existing automatic-termination path runs.
 Appended to `artifacts/coinrun_bundle/transfer_telemetry.jsonl` and mirrored in
 the launcher state under `bundle_transfer`: `launch_to_endpoint_seconds`,
 `launch_to_ssh_seconds`, `transfer_seconds`, `transfer_bytes`,
-`transfer_bytes_per_second`, `remote_verify_extract_seconds`,
+`transfer_bytes_per_second`, `transfer_source`, `bundle_bytes_verified`,
+`remote_verify_extract_seconds`,
 `experiment_started_utc`, `setup_seconds`. No credentials are recorded.
 
 Small, manually verified historical transfer probes are tracked in

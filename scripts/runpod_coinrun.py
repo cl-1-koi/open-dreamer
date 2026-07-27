@@ -25,7 +25,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Sequence
 
 
@@ -63,6 +63,8 @@ GPU_IDS = {
 TERMINAL_TERMINATION_STATES = {"pod_absent", "terminated"}
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RUNPOD_RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+RUNPOD_DATACENTER_ID_RE = re.compile(r"^[A-Z0-9-]+$")
 
 
 class DeploymentError(RuntimeError):
@@ -1139,7 +1141,7 @@ def make_bundle_pod_payload(
     which is how the bundle gets in.
     """
 
-    return {
+    payload = {
         "name": pod_name,
         "imageName": plan.base_image,
         "computeType": "GPU",
@@ -1164,6 +1166,7 @@ def make_bundle_pod_payload(
         "dockerEntrypoint": ["/bin/bash", "-lc"],
         "dockerStartCmd": [encode_start_command(build_bundle_bootstrap(deadline_epoch))],
     }
+    return attach_network_volume(payload, args)
 
 
 def extract_ssh_endpoint(pod: dict[str, Any]) -> tuple[str, int] | None:
@@ -1515,6 +1518,7 @@ def install_remote_bundle(
     key: Path,
     known_hosts: Path,
     plan: BundlePlan,
+    staging_dir: str = REMOTE_STAGING_DIR,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     timeout: float | None = None,
 ) -> None:
@@ -1522,7 +1526,7 @@ def install_remote_bundle(
     command = ssh_command(
         host, port, key=key, known_hosts=known_hosts,
         remote=[
-            "bash", "-s", "--", REMOTE_STAGING_DIR, str(archive["filename"]),
+            "bash", "-s", "--", staging_dir, str(archive["filename"]),
             str(archive["sha256"]), str(archive["bytes"]), IMAGE_ROOT,
             plan.manifest_path.name,
             sha256_file(plan.manifest_path),
@@ -1676,53 +1680,66 @@ def perform_bundle_setup(
         sleep(args.poll_seconds)
     ssh_ready_seconds = clock() - started
 
-    prepare = runner(
-        ssh_command(
-            host, port, key=key, known_hosts=known_hosts,
-            remote=["mkdir", "-p", REMOTE_STAGING_DIR],
-        ),
-        capture_output=True, text=True, check=False, timeout=120,
-    )
-    if prepare.returncode != 0:
-        raise DeploymentError(
-            f"could not create {REMOTE_STAGING_DIR}: {prepare.stderr.strip()[:300]}"
-        )
-
-    transfer_started = clock()
+    volume_config = validate_network_volume_args(args)
+    volume_bundle_dir = str(getattr(args, "bundle_volume_dir", "") or "").strip()
     relay_host = str(getattr(args, "bundle_relay_host", "") or "").strip()
-    if relay_host:
-        transfer_bundle_via_relay(
-            relay_host,
-            str(args.bundle_relay_dir),
-            host,
-            port,
-            pod_id=pod_id,
-            key=key,
-            plan=plan,
-            runner=runner,
-            timeout=max(1.0, setup_deadline - clock()),
-        )
+    logical_bundle_bytes = (
+        plan.archive_path.stat().st_size + plan.manifest_path.stat().st_size
+    )
+    if volume_bundle_dir:
+        staging_dir = volume_bundle_dir
+        transfer_seconds = 0.0
+        transfer_bytes = 0
+        transfer_source = f"network-volume:{volume_config['id']}"
     else:
-        for source in (plan.archive_path, plan.manifest_path):
-            transfer = runner(
-                rsync_command(
-                    source, host, port, key=key, known_hosts=known_hosts,
-                    destination=f"{REMOTE_STAGING_DIR}/",
-                ),
-                capture_output=True, text=True, check=False,
+        staging_dir = REMOTE_STAGING_DIR
+        prepare = runner(
+            ssh_command(
+                host, port, key=key, known_hosts=known_hosts,
+                remote=["mkdir", "-p", staging_dir],
+            ),
+            capture_output=True, text=True, check=False, timeout=120,
+        )
+        if prepare.returncode != 0:
+            raise DeploymentError(
+                f"could not create {staging_dir}: {prepare.stderr.strip()[:300]}"
+            )
+        transfer_started = clock()
+        if relay_host:
+            transfer_bundle_via_relay(
+                relay_host,
+                str(args.bundle_relay_dir),
+                host,
+                port,
+                pod_id=pod_id,
+                key=key,
+                plan=plan,
+                runner=runner,
                 timeout=max(1.0, setup_deadline - clock()),
             )
-            if transfer.returncode != 0:
-                raise DeploymentError(
-                    f"rsync of {source.name} failed (exit {transfer.returncode}): "
-                    f"{transfer.stderr.strip()[:400]}"
+        else:
+            for source in (plan.archive_path, plan.manifest_path):
+                transfer = runner(
+                    rsync_command(
+                        source, host, port, key=key, known_hosts=known_hosts,
+                        destination=f"{staging_dir}/",
+                    ),
+                    capture_output=True, text=True, check=False,
+                    timeout=max(1.0, setup_deadline - clock()),
                 )
-    transfer_seconds = clock() - transfer_started
-    transfer_bytes = plan.archive_path.stat().st_size + plan.manifest_path.stat().st_size
+                if transfer.returncode != 0:
+                    raise DeploymentError(
+                        f"rsync of {source.name} failed (exit {transfer.returncode}): "
+                        f"{transfer.stderr.strip()[:400]}"
+                    )
+        transfer_seconds = clock() - transfer_started
+        transfer_bytes = logical_bundle_bytes
+        transfer_source = f"relay:{relay_host}" if relay_host else "local"
 
     verify_started = clock()
     install_remote_bundle(
         host, port, key=key, known_hosts=known_hosts, plan=plan,
+        staging_dir=staging_dir,
         runner=runner, timeout=max(1.0, setup_deadline - clock()),
     )
     verify_seconds = clock() - verify_started
@@ -1770,7 +1787,8 @@ def perform_bundle_setup(
         "transfer_seconds": round(transfer_seconds, 3),
         "transfer_bytes": transfer_bytes,
         "transfer_bytes_per_second": round(transfer_bytes / max(transfer_seconds, 1e-6), 1),
-        "transfer_source": f"relay:{relay_host}" if relay_host else "local",
+        "transfer_source": transfer_source,
+        "bundle_bytes_verified": logical_bundle_bytes,
         "remote_verify_extract_seconds": round(verify_seconds, 3),
         "experiment_started_utc": isoformat(utc_now()),
         "setup_seconds": round(total, 3),
@@ -1794,7 +1812,7 @@ def make_pod_payload(
         stream_token=stream_token,
         deadline_epoch=deadline_epoch,
     )
-    return {
+    payload = {
         "name": pod_name,
         "imageName": args.image,
         "computeType": "GPU",
@@ -1813,6 +1831,7 @@ def make_pod_payload(
         "dockerEntrypoint": ["/bin/bash", "-lc"],
         "dockerStartCmd": [encode_start_command(remote_script)],
     }
+    return attach_network_volume(payload, args)
 
 
 def fetch_log_chunk(
@@ -2157,6 +2176,84 @@ def validate_setup_timeout(value: int) -> int:
     return value
 
 
+def validate_network_volume_args(args: argparse.Namespace) -> dict[str, str] | None:
+    """Return a normalized RunPod network-volume request or fail closed."""
+
+    volume_id = str(getattr(args, "network_volume_id", "") or "").strip()
+    data_center_id = str(
+        getattr(args, "network_volume_data_center_id", "") or ""
+    ).strip()
+    bundle_dir = str(getattr(args, "bundle_volume_dir", "") or "").strip()
+    mount_path = str(
+        getattr(args, "network_volume_mount_path", "/runpod-volume")
+        or "/runpod-volume"
+    ).strip()
+    selected = bool(volume_id or data_center_id or bundle_dir)
+    if not selected:
+        return None
+    if not volume_id or not RUNPOD_RESOURCE_ID_RE.fullmatch(volume_id):
+        raise DeploymentError(
+            "--network-volume-id is required and must be a safe RunPod resource ID"
+        )
+    if (
+        not data_center_id
+        or not RUNPOD_DATACENTER_ID_RE.fullmatch(data_center_id)
+    ):
+        raise DeploymentError(
+            "--network-volume-data-center-id is required and must resemble US-NC-1"
+        )
+
+    mount = PurePosixPath(mount_path)
+    if not mount.is_absolute() or ".." in mount.parts or mount == PurePosixPath("/"):
+        raise DeploymentError(
+            "--network-volume-mount-path must be an absolute non-root pod path"
+        )
+    if bundle_dir:
+        bundle = PurePosixPath(bundle_dir)
+        if not bundle.is_absolute() or ".." in bundle.parts:
+            raise DeploymentError("--bundle-volume-dir must be an absolute pod path")
+        try:
+            bundle.relative_to(mount)
+        except ValueError as exc:
+            raise DeploymentError(
+                "--bundle-volume-dir must be inside --network-volume-mount-path"
+            ) from exc
+        if getattr(args, "transport", "image") != "bundle":
+            raise DeploymentError(
+                "--bundle-volume-dir is meaningful only with --transport bundle"
+            )
+        if str(getattr(args, "bundle_relay_host", "") or "").strip():
+            raise DeploymentError(
+                "--bundle-volume-dir and --bundle-relay-host are mutually exclusive"
+            )
+    return {
+        "id": volume_id,
+        "data_center_id": data_center_id,
+        "mount_path": str(mount),
+        "bundle_dir": str(PurePosixPath(bundle_dir)) if bundle_dir else "",
+    }
+
+
+def attach_network_volume(
+    payload: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
+    """Attach a pre-existing volume and constrain placement to its data center."""
+
+    config = validate_network_volume_args(args)
+    if config is None:
+        return payload
+    payload.pop("volumeInGb", None)
+    payload.update(
+        {
+            "networkVolumeId": config["id"],
+            "volumeMountPath": config["mount_path"],
+            "dataCenterIds": [config["data_center_id"]],
+            "dataCenterPriority": "custom",
+        }
+    )
+    return payload
+
+
 def run_launch(
     args: argparse.Namespace,
     *,
@@ -2173,6 +2270,7 @@ def run_launch(
     state_path = Path(args.state).expanduser().resolve()
     repo_root = Path(args.repo_root).resolve()
     transport = getattr(args, "transport", "image")
+    network_volume = validate_network_volume_args(args)
     setup_seconds = 0
     plan: BundlePlan | None = None
     public_key = ""
@@ -2240,6 +2338,14 @@ def run_launch(
         f"Remote checkout: cl-1-koi/open-dreamer "
         f"{git_state.branch}@{git_state.commit_sha}"
     )
+    if network_volume is not None:
+        print(
+            f"RunPod network volume: {network_volume['id']} in "
+            f"{network_volume['data_center_id']} mounted at "
+            f"{network_volume['mount_path']}"
+        )
+        if network_volume["bundle_dir"]:
+            print(f"Bundle cache: {network_volume['bundle_dir']}")
     if not args.execute:
         print("Dry run only; no pod was started. Pass --execute to launch.")
         return 0
@@ -2280,6 +2386,8 @@ def run_launch(
         "termination_status": "not_requested",
         "stream_token": stream_token,
     }
+    if network_volume is not None:
+        provisional_state["network_volume"] = network_volume
     with state_lock(state_path):
         if state_path.exists() and state_is_active(read_json(state_path)):
             raise DeploymentError("Active RunPod state appeared during launch")
@@ -2572,6 +2680,29 @@ def build_parser() -> argparse.ArgumentParser:
         default="/root/coinrun-bundles",
         help="Directory on --bundle-relay-host containing the archive and manifest.",
     )
+    launch.add_argument(
+        "--network-volume-id",
+        default="",
+        help="Existing RunPod network-volume ID to attach to the pod.",
+    )
+    launch.add_argument(
+        "--network-volume-mount-path",
+        default="/runpod-volume",
+        help="Absolute pod path where the RunPod network volume is mounted.",
+    )
+    launch.add_argument(
+        "--network-volume-data-center-id",
+        default="",
+        help="RunPod data center containing the volume, for example US-NC-1.",
+    )
+    launch.add_argument(
+        "--bundle-volume-dir",
+        default="",
+        help=(
+            "Verified archive and manifest directory on the attached volume. "
+            "When set, bundle setup performs no rsync."
+        ),
+    )
     launch.add_argument("--ssh-key", type=Path, default=Path("~/.ssh/id_ed25519"))
     launch.add_argument(
         "--ssh-public-key", type=Path, default=Path("~/.ssh/id_ed25519.pub")
@@ -2628,6 +2759,7 @@ def validate_cli_args(args: argparse.Namespace) -> None:
     if args.command != "launch":
         return
     relay_host = str(getattr(args, "bundle_relay_host", "") or "").strip()
+    validate_network_volume_args(args)
     if relay_host and (
         relay_host.startswith("-")
         or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", relay_host)

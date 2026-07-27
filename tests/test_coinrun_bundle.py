@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -750,14 +751,25 @@ class ContractEnvExportTests(unittest.TestCase):
 
 
 class PodPayloadTests(unittest.TestCase):
-    def payload(self, root: Path):
+    def payload(self, root: Path, **overrides):
         manifest_path, bundle_dir, _, _ = write_bundle(root)
         plan = plan_for(root, manifest_path, bundle_dir)
         offer = rc.GPUOffer(
             choice="H200", gpu_id="NVIDIA H200", display_name="H200", memory_gb=141,
             stock_status="High", available_gpu_counts=(1,), hourly_price=Decimal("2"),
         )
-        args = SimpleNamespace(cloud="secure", container_disk_gb=100)
+        args = SimpleNamespace(
+            cloud="secure",
+            container_disk_gb=100,
+            transport="bundle",
+            bundle_relay_host="",
+            network_volume_id="",
+            network_volume_data_center_id="",
+            network_volume_mount_path="/runpod-volume",
+            bundle_volume_dir="",
+        )
+        for name, value in overrides.items():
+            setattr(args, name, value)
         return rc.make_bundle_pod_payload(
             args, offer, plan, "pod-name", "ssh-ed25519 AAAA user@host", 2_000_000_000
         )
@@ -798,6 +810,20 @@ class PodPayloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             payload = self.payload(Path(directory))
         self.assertEqual(payload["imageName"], f"runpod/pytorch@{BASE_DIGEST}")
+
+    def test_bundle_pod_can_attach_a_volume_and_constrain_placement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.payload(
+                Path(directory),
+                network_volume_id="volume-123",
+                network_volume_data_center_id="US-NC-1",
+                bundle_volume_dir="/runpod-volume/coinrun-bundles",
+            )
+        self.assertEqual(payload["networkVolumeId"], "volume-123")
+        self.assertEqual(payload["volumeMountPath"], "/runpod-volume")
+        self.assertEqual(payload["dataCenterIds"], ["US-NC-1"])
+        self.assertEqual(payload["dataCenterPriority"], "custom")
+        self.assertNotIn("volumeInGb", payload)
 
 
 class RemoteHardeningTests(unittest.TestCase):
@@ -857,6 +883,97 @@ class SetupBudgetTests(unittest.TestCase):
                 with self.assertRaises(rc.DeploymentError):
                     rc.validate_setup_timeout(value)
         self.assertEqual(rc.validate_setup_timeout(600), 600)
+
+
+class NetworkVolumeTests(unittest.TestCase):
+    def args(self, **overrides):
+        args = SimpleNamespace(
+            transport="bundle",
+            bundle_relay_host="",
+            network_volume_id="volume-123",
+            network_volume_data_center_id="US-NC-1",
+            network_volume_mount_path="/runpod-volume",
+            bundle_volume_dir="/runpod-volume/coinrun-bundles",
+        )
+        for name, value in overrides.items():
+            setattr(args, name, value)
+        return args
+
+    def test_volume_bundle_directory_must_be_inside_the_mount(self):
+        with self.assertRaises(rc.DeploymentError):
+            rc.validate_network_volume_args(
+                self.args(bundle_volume_dir="/workspace/coinrun-bundles")
+            )
+
+    def test_volume_cache_and_relay_are_mutually_exclusive(self):
+        with self.assertRaises(rc.DeploymentError):
+            rc.validate_network_volume_args(
+                self.args(bundle_relay_host="fw-robot1")
+            )
+
+    def test_partial_volume_configuration_is_rejected(self):
+        with self.assertRaises(rc.DeploymentError):
+            rc.validate_network_volume_args(
+                self.args(network_volume_data_center_id="")
+            )
+
+    def test_volume_bundle_setup_skips_rsync_and_uses_cached_files(self):
+        class Api:
+            def get_pod(self, pod_id):
+                return {
+                    "publicIp": "1.2.3.4",
+                    "portMappings": {"22": 40022},
+                }
+
+        commands = []
+
+        def runner(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path, bundle_dir, _, _ = write_bundle(root)
+            plan = plan_for(root, manifest_path, bundle_dir)
+            key = root / "id"
+            key.write_text("private", encoding="utf-8")
+            args = self.args(
+                state=root / "state.json",
+                ssh_key=key,
+                poll_seconds=0.01,
+                experiment_command="coinrun-runner experiment",
+                runtime_seconds=300,
+                remote_artifact_dir="/workspace/artifacts",
+            )
+            git_state = rc.GitState("branch", COMMIT, rc.GITHUB_REPO_URL)
+            with (
+                mock.patch.object(rc, "install_remote_bundle") as install,
+                mock.patch.object(rc, "install_remote_script"),
+                mock.patch.object(rc, "start_remote_experiment"),
+            ):
+                telemetry = rc.perform_bundle_setup(
+                    Api(),
+                    "pod-1",
+                    plan=plan,
+                    args=args,
+                    git_state=git_state,
+                    stream_token="token",
+                    deadline_epoch=2_000_000_000,
+                    setup_deadline=100.0,
+                    clock=lambda: 0.0,
+                    sleep=lambda _: None,
+                    runner=runner,
+                )
+        install.assert_called_once()
+        self.assertEqual(
+            install.call_args.kwargs["staging_dir"],
+            "/runpod-volume/coinrun-bundles",
+        )
+        self.assertEqual(telemetry["transfer_bytes"], 0)
+        self.assertEqual(telemetry["transfer_seconds"], 0.0)
+        self.assertEqual(telemetry["transfer_source"], "network-volume:volume-123")
+        self.assertFalse(any("rsync" in " ".join(command) for command in commands))
+        self.assertFalse(any("mkdir" in " ".join(command) for command in commands))
 
 
 class NoLaunchOnLocalFailureTests(unittest.TestCase):
