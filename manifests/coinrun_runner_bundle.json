@@ -1,19 +1,19 @@
 {
   "archive": {
-    "bytes": 3000764892,
+    "bytes": 3020906356,
     "compression": "zstd",
     "compression_level": 9,
-    "filename": "coinrun-opt-195069f66bce.tar.zst",
-    "sha256": "b77b3bb05b6ecb6c1a5a70344b2f08b091fb20b3c57392a6e48ed10690d7d3c2",
-    "uncompressed_bytes": 6911641600,
-    "uncompressed_tar_sha256": "eb7d08479c69404794ed14641640ab56ec446896639aeaa4a87cb0b9d7b0a928"
+    "filename": "coinrun-opt-13c0534ef057.tar.zst",
+    "sha256": "958a2febba08f786f9be1886c1239a0f32634999f1ae12f87f4c8e3cae1c98ae",
+    "uncompressed_bytes": 6964398080,
+    "uncompressed_tar_sha256": "bfaf09d24949d41433be002a3791fe0d6912646859f8f34a9e7d8c9b4b3cefaf"
   },
   "base_image": {
     "digest": "sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f",
     "reference": "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"
   },
   "build": {
-    "command": "docker run --rm --entrypoint tar 8785f6fe9a2f --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu -C /opt -cf - coinrun",
+    "command": "docker run --rm --entrypoint tar coinrun-runner:slim --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu -C /opt -cf - coinrun",
     "determinism": "tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner; payload still contains absolute paths and bytecode, so reconstruction is semantic, not bit-exact",
     "tool_versions": {
       "docker": "Docker version 28.5.1, build e180ab8",
@@ -21,9 +21,15 @@
       "zstd": "*** zstd command line interface 64-bits v1.4.8, by Yann Collet ***"
     }
   },
+  "build_inputs": {
+    "dockerfile_sha256": "7232942efde08b3494c8f84e0c39015e9be3cafe20bb0929297a45e07735513c",
+    "generator_dependency_sha256": "861a4977c7c296e24a34cf6564cb18765151183223711bf9bb2120510d03ccd4",
+    "generator_sha256": "a8215427441771de19ebe9f1231dc202326ea4a05d64b9c64e88345577856567",
+    "uv_lock_sha256": "795e24f0e9b1ec29a41064721afd40910af73ff0233f4c4114eecd773281f066"
+  },
   "contract_env": {
     "COINRUN_IMAGE_CONTRACT": "1",
-    "COINRUN_SOURCE_COMMIT": "195069f66bce8f8f262a7b17ba16d193b25961d5",
+    "COINRUN_SOURCE_COMMIT": "13c0534ef057f30ef2c8f4f5913dc5d1171dda1c",
     "COINRUN_UV_LOCK_SHA256": "795e24f0e9b1ec29a41064721afd40910af73ff0233f4c4114eecd773281f066",
     "UV_CACHE_DIR": "/opt/coinrun/uv-cache",
     "UV_COMPILE_BYTECODE": "1",
@@ -32,7 +38,7 @@
     "UV_PYTHON_DOWNLOADS": "never",
     "UV_PYTHON_INSTALL_DIR": "/opt/coinrun/python"
   },
-  "created_utc": "2026-07-27T04:08:31.068959Z",
+  "created_utc": "2026-07-27T06:35:06.965865Z",
   "extract": {
     "expected_top_level": "coinrun",
     "parent": "/opt",
@@ -40,10 +46,10 @@
   },
   "schema": "coinrun-runner-bundle-v1",
   "source": {
-    "commit": "195069f66bce8f8f262a7b17ba16d193b25961d5",
-    "dockerfile_sha256": "b60c71f5367ae97922871c925b4ea54741cf90ca5f0f7349b745b34e11c92871",
-    "image_id": "sha256:8785f6fe9a2f598101186a8b45f72b80e313b640fd0a2e2efbbaf0ed22335ff0",
-    "image_reference": "8785f6fe9a2f",
+    "commit": "13c0534ef057f30ef2c8f4f5913dc5d1171dda1c",
+    "dockerfile_sha256": "7232942efde08b3494c8f84e0c39015e9be3cafe20bb0929297a45e07735513c",
+    "image_id": "sha256:3ae4fa9bf9591cb9140ae5ea9e544e477b2a606f824286619dd0cd69d9c9b5d6",
+    "image_reference": "coinrun-runner:slim",
     "uv_lock_sha256": "795e24f0e9b1ec29a41064721afd40910af73ff0233f4c4114eecd773281f066"
   }
 }
