@@ -257,14 +257,14 @@ class RunPodAPI:
             raise APIError("RunPod API returned invalid JSON") from exc
 
     def graphql(self, query: str) -> dict[str, Any]:
-        url = (
-            f"{GRAPHQL_URL}?api_key="
-            f"{urllib.parse.quote(self._api_key, safe='')}"
-        )
         request = urllib.request.Request(
-            url,
+            GRAPHQL_URL,
             data=json.dumps({"query": query}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "cl-1-koi-open-dreamer-coinrun/1",
+            },
             method="POST",
         )
         response = self._request_json(request)

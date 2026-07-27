@@ -223,6 +223,24 @@ class CredentialAndHTTPTests(unittest.TestCase):
         self.assertNotIn(key, str(context.exception))
         self.assertIn("<redacted>", str(context.exception))
 
+    def test_graphql_uses_current_bearer_endpoint_without_query_key(self):
+        seen = {}
+
+        def opener(request, timeout):
+            seen["url"] = request.full_url
+            seen["authorization"] = request.get_header("Authorization")
+            seen["user_agent"] = request.get_header("User-agent")
+            return FakeResponse(b'{"data":{"myself":{}}}')
+
+        api = runpod_coinrun.RunPodAPI("top-secret", opener=opener)
+        result = api.graphql("query { myself { clientBalance } }")
+
+        self.assertEqual(result, {"myself": {}})
+        self.assertEqual(seen["url"], "https://api.runpod.io/graphql")
+        self.assertEqual(seen["authorization"], "Bearer top-secret")
+        self.assertIn("open-dreamer-coinrun", seen["user_agent"])
+        self.assertNotIn("top-secret", seen["url"])
+
     def test_log_stream_uses_bearer_token_and_offset(self):
         seen = {}
 
