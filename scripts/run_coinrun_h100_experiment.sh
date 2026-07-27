@@ -221,6 +221,9 @@ run_phase() {
   printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$started" "$(( $(date +%s) - started ))" "$rc" "$effective" >> "$PHASE_TIMINGS"
   if ((rc != 0)); then
     FINAL_ERROR="phase $name failed with status $rc; see $LOG_DIR/$name.log"
+    printf '\n--- failed phase %s: last 100 log lines ---\n' "$name" >&2
+    tail -n 100 "$LOG_DIR/$name.log" >&2 || true
+    printf '%s\n' '--- end failed phase log ---' >&2
   fi
   return "$rc"
 }
