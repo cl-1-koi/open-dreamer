@@ -866,7 +866,7 @@ def build_remote_script(
           set -Eeuo pipefail
           command -v git >/dev/null
           rm -rf "$REPO_DIR"
-          git clone --single-branch --branch %(branch)s --no-checkout \
+          git clone --depth 1 --single-branch --branch %(branch)s --no-checkout \
             %(repo_url)s "$REPO_DIR"
           cd "$REPO_DIR"
           git checkout --detach %(commit)s

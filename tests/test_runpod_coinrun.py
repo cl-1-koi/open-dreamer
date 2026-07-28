@@ -406,7 +406,7 @@ class DiscoveryAndRemoteBootstrapTests(unittest.TestCase):
         )
 
         self.assertIn(
-            f"git clone --single-branch --branch {BRANCH} --no-checkout",
+            f"git clone --depth 1 --single-branch --branch {BRANCH} --no-checkout",
             script,
         )
         self.assertIn(runpod_coinrun.GITHUB_REPO_URL, script)

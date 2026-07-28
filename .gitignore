@@ -9,6 +9,7 @@ run_job.sh
 logs
 /data/
 /artifacts/runpod_coinrun/
+/dreamer/fvd/i3d_pretrained_400.npz
 
 # Next.js / frontend
 frontend/**/.next/
