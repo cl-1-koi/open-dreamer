@@ -576,6 +576,43 @@ class LaunchFlowTests(unittest.TestCase):
                 state["termination_reason"], "launch-or-experiment-failure"
             )
 
+    def test_success_can_retain_pod_until_hard_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = launch_args(root, execute=True)
+            args.retain_on_success = True
+            api = FakeAPI()
+
+            def monitor(api_arg, state_path, **kwargs):
+                state = runpod_coinrun.read_json(state_path)
+                return {
+                    "complete": True,
+                    "returncode": 0,
+                    "commit_sha": state["commit_sha"],
+                }
+
+            result = runpod_coinrun.run_launch(
+                args,
+                api_factory=lambda key: api,
+                git_runner=git_runner(),
+                monitor=monitor,
+                clock=mock.Mock(return_value=100.0),
+                now=lambda: datetime(2026, 7, 27, tzinfo=timezone.utc),
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(api.delete_calls, [])
+            state = runpod_coinrun.read_json(args.state)
+            self.assertEqual(state["phase"], "retained")
+            self.assertEqual(
+                state["termination_status"],
+                "not_requested",
+            )
+            self.assertEqual(
+                state["retention_reason"],
+                "follow-up-experiments",
+            )
+
     def test_ambiguous_create_failure_stays_active_for_reconciliation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -2482,12 +2482,23 @@ def run_launch(
         except BaseException as exc:
             failure = exc
 
+    retain_on_success = bool(
+        getattr(args, "retain_on_success", False)
+    )
     termination_error: BaseException | None = None
     reason = "experiment-complete" if failure is None else "launch-or-experiment-failure"
-    try:
-        terminate_managed_pod(api, state_path, reason=reason)
-    except BaseException as exc:
-        termination_error = exc
+    if failure is None and retain_on_success:
+        update_state(
+            state_path,
+            phase="retained",
+            retention_reason="follow-up-experiments",
+            retained_utc=isoformat(utc_now()),
+        )
+    else:
+        try:
+            terminate_managed_pod(api, state_path, reason=reason)
+        except BaseException as exc:
+            termination_error = exc
 
     if failure is not None:
         if termination_error is not None:
@@ -2497,10 +2508,16 @@ def run_launch(
         raise failure
     if termination_error is not None:
         raise termination_error
-    print(
-        f"CoinRun experiment completed and pod {pod_id} was terminated. "
-        f"State: {state_path}"
-    )
+    if retain_on_success:
+        print(
+            f"CoinRun experiment completed and pod {pod_id} was retained "
+            f"until its hard deadline. State: {state_path}"
+        )
+    else:
+        print(
+            f"CoinRun experiment completed and pod {pod_id} was terminated. "
+            f"State: {state_path}"
+        )
     return 0
 
 
@@ -2736,6 +2753,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="Perform the paid RunPod mutation after all gates pass",
+    )
+    launch.add_argument(
+        "--retain-on-success",
+        action="store_true",
+        help=(
+            "Leave a successful pod available for follow-up work; its remote "
+            "hard-deadline watchdog still terminates it"
+        ),
     )
     launch.set_defaults(handler=run_launch)
 
