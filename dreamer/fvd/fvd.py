@@ -163,8 +163,9 @@ def load_i3d_pretrained(weights_path=None):
 
     Search order:
     1. Explicit weights_path if provided
-    2. dreamer/fvd/i3d_pretrained_400.npz (next to this file)
-    3. i3d_pretrained_400.pt in same directory or fvd/videogpt/ (auto-convert)
+    2. OPEN_DREAMER_I3D_WEIGHTS, if set
+    3. dreamer/fvd/i3d_pretrained_400.npz (next to this file)
+    4. i3d_pretrained_400.pt in same directory or fvd/videogpt/ (auto-convert)
 
     Returns:
         Nested param dict ready for _i3d_forward().
@@ -173,7 +174,10 @@ def load_i3d_pretrained(weights_path=None):
     if weights_path is not None:
         npz_path = weights_path
     else:
-        npz_path = os.path.join(this_dir, 'i3d_pretrained_400.npz')
+        npz_path = os.environ.get(
+            'OPEN_DREAMER_I3D_WEIGHTS',
+            os.path.join(this_dir, 'i3d_pretrained_400.npz'),
+        )
     if not os.path.exists(npz_path):
         pt_candidates = [
             os.path.join(this_dir, 'i3d_pretrained_400.pt'),
@@ -183,8 +187,10 @@ def load_i3d_pretrained(weights_path=None):
         if pt_path is None:
             raise FileNotFoundError(
                 f"I3D weights not found at {npz_path}. "
-                "Place i3d_pretrained_400.npz in dreamer/fvd/, or "
-                "i3d_pretrained_400.pt in dreamer/fvd/ or fvd/videogpt/ for auto-conversion.")
+                "Run scripts/fetch_external_artifacts.py with Scaleway S3 "
+                "credentials, set OPEN_DREAMER_I3D_WEIGHTS, or place "
+                "i3d_pretrained_400.pt in dreamer/fvd/ or fvd/videogpt/ "
+                "for auto-conversion.")
         print("Converting PyTorch I3D weights to JAX format...")
         _convert_pt_to_npz(pt_path, npz_path)
 

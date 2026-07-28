@@ -1,0 +1,12 @@
+{
+  "artifacts": [
+    {
+      "bytes": 50925408,
+      "name": "i3d_pretrained_400",
+      "path": "dreamer/fvd/i3d_pretrained_400.npz",
+      "sha256": "a8c2c667b30d3b7d2e1d13a1163e5ded441e847dd59f4a8d2b6408ba36e6c55b",
+      "uri": "s3://fable-es-artifacts/open-dreamer/weights/i3d_pretrained_400-a8c2c667b30d3b7d.npz"
+    }
+  ],
+  "schema": "open-dreamer-external-artifacts-v1"
+}
